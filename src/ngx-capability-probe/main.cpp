@@ -7,11 +7,15 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <DirectXPackedVector.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -63,6 +67,86 @@ using CreateFeature = NgxResult (*)(ID3D12GraphicsCommandList*, int, NgxParamete
 using EvaluateFeature = NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, const NgxParameter*, void*);
 using ReleaseFeature = NgxResult (*)(NgxHandle*);
 constexpr NgxResult NgxException = 0x7FFFFFFF;
+
+struct RgbImage
+{
+    UINT width = 0;
+    UINT height = 0;
+    std::vector<unsigned char> pixels;
+};
+
+std::optional<std::string> ReadPpmToken(std::istream& stream)
+{
+    std::string token;
+    for (;;)
+    {
+        stream >> std::ws;
+        if (!stream.good()) return std::nullopt;
+        if (stream.peek() != '#') break;
+        stream.ignore((std::numeric_limits<std::streamsize>::max)(), '\n');
+    }
+    if (!(stream >> token)) return std::nullopt;
+    return token;
+}
+
+std::optional<RgbImage> LoadPpm(const std::filesystem::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream)
+    {
+        std::wcerr << L"Could not open input frame: " << path << L'\n';
+        return std::nullopt;
+    }
+
+    const auto magic = ReadPpmToken(stream);
+    const auto widthToken = ReadPpmToken(stream);
+    const auto heightToken = ReadPpmToken(stream);
+    const auto maximumToken = ReadPpmToken(stream);
+    if (!magic || !widthToken || !heightToken || !maximumToken || *magic != "P6")
+    {
+        std::cerr << "Input must be a binary PPM (P6) image.\n";
+        return std::nullopt;
+    }
+
+    RgbImage image;
+    try
+    {
+        const unsigned long width = std::stoul(*widthToken);
+        const unsigned long height = std::stoul(*heightToken);
+        if (std::stoul(*maximumToken) != 255 || width == 0 || height == 0 ||
+            width > 8192 || height > 8192)
+            throw std::invalid_argument("unsupported PPM dimensions or range");
+        image.width = static_cast<UINT>(width);
+        image.height = static_cast<UINT>(height);
+    }
+    catch (const std::exception&)
+    {
+        std::cerr << "Invalid PPM header. Only 8-bit P6 images are supported.\n";
+        return std::nullopt;
+    }
+
+    stream.get(); // consume the single whitespace byte before binary pixels
+    const size_t byteCount = static_cast<size_t>(image.width) * image.height * 3;
+    image.pixels.resize(byteCount);
+    stream.read(reinterpret_cast<char*>(image.pixels.data()), static_cast<std::streamsize>(byteCount));
+    if (stream.gcount() != static_cast<std::streamsize>(byteCount))
+    {
+        std::cerr << "The PPM pixel data is incomplete.\n";
+        return std::nullopt;
+    }
+    return image;
+}
+
+bool SavePpm(const std::filesystem::path& path, const RgbImage& image)
+{
+    std::ofstream stream(path, std::ios::binary);
+    if (!stream) return false;
+    stream << "P6\n" << image.width << ' ' << image.height << "\n255\n";
+    stream.write(
+        reinterpret_cast<const char*>(image.pixels.data()),
+        static_cast<std::streamsize>(image.pixels.size()));
+    return stream.good();
+}
 
 NgxResult SafeInitExt(
     InitExt function,
@@ -297,6 +381,171 @@ ComPtr<ID3D12Resource> CreateTexture(
     return resource;
 }
 
+ComPtr<ID3D12Resource> CreateBuffer(
+    ID3D12Device* device,
+    UINT64 size,
+    D3D12_HEAP_TYPE heapType,
+    D3D12_RESOURCE_STATES initialState)
+{
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = heapType;
+
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    description.Width = size;
+    description.Height = 1;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> resource;
+    const HRESULT result = device->CreateCommittedResource(
+        &heap,
+        D3D12_HEAP_FLAG_NONE,
+        &description,
+        initialState,
+        nullptr,
+        IID_PPV_ARGS(&resource));
+    if (FAILED(result))
+        std::cerr << "CreateCommittedResource(buffer) failed: 0x"
+                  << std::hex << result << std::dec << '\n';
+    return resource;
+}
+
+bool ExecuteAndWait(
+    ID3D12Device* device,
+    ID3D12CommandQueue* queue,
+    ID3D12GraphicsCommandList* list);
+
+bool UploadRgbAsHalf(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* list,
+    ID3D12Resource* destination,
+    const RgbImage& image,
+    ComPtr<ID3D12Resource>& upload)
+{
+    const auto description = destination->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    UINT64 rowBytes = 0;
+    UINT64 totalBytes = 0;
+    device->GetCopyableFootprints(
+        &description, 0, 1, 0, &footprint, &rows, &rowBytes, &totalBytes);
+    upload = CreateBuffer(
+        device, totalBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!upload) return false;
+
+    unsigned char* mapped = nullptr;
+    D3D12_RANGE noRead{0, 0};
+    if (FAILED(upload->Map(0, &noRead, reinterpret_cast<void**>(&mapped)))) return false;
+    for (UINT y = 0; y < image.height; ++y)
+    {
+        auto* row = reinterpret_cast<uint16_t*>(mapped + footprint.Offset +
+            static_cast<size_t>(y) * footprint.Footprint.RowPitch);
+        for (UINT x = 0; x < image.width; ++x)
+        {
+            const size_t source = (static_cast<size_t>(y) * image.width + x) * 3;
+            const size_t target = static_cast<size_t>(x) * 4;
+            row[target + 0] = DirectX::PackedVector::XMConvertFloatToHalf(
+                image.pixels[source + 0] / 255.0f);
+            row[target + 1] = DirectX::PackedVector::XMConvertFloatToHalf(
+                image.pixels[source + 1] / 255.0f);
+            row[target + 2] = DirectX::PackedVector::XMConvertFloatToHalf(
+                image.pixels[source + 2] / 255.0f);
+            row[target + 3] = DirectX::PackedVector::XMConvertFloatToHalf(1.0f);
+        }
+    }
+    upload->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = upload.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION target{};
+    target.pResource = destination;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    target.SubresourceIndex = 0;
+    list->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = destination;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    list->ResourceBarrier(1, &barrier);
+    return true;
+}
+
+std::optional<RgbImage> ReadHalfAsRgb(
+    ID3D12Device* device,
+    ID3D12CommandQueue* queue,
+    ID3D12CommandAllocator* allocator,
+    ID3D12GraphicsCommandList* list,
+    ID3D12Resource* source,
+    UINT width,
+    UINT height)
+{
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr))) return std::nullopt;
+
+    const auto description = source->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT rows = 0;
+    UINT64 rowBytes = 0;
+    UINT64 totalBytes = 0;
+    device->GetCopyableFootprints(
+        &description, 0, 1, 0, &footprint, &rows, &rowBytes, &totalBytes);
+    auto readback = CreateBuffer(
+        device, totalBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!readback) return std::nullopt;
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = source;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    list->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION from{};
+    from.pResource = source;
+    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource = readback.Get();
+    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    to.PlacedFootprint = footprint;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    if (!ExecuteAndWait(device, queue, list)) return std::nullopt;
+
+    void* mappedRaw = nullptr;
+    D3D12_RANGE readRange{0, static_cast<SIZE_T>(totalBytes)};
+    if (FAILED(readback->Map(0, &readRange, &mappedRaw)))
+        return std::nullopt;
+    const auto* mapped = static_cast<const unsigned char*>(mappedRaw);
+
+    RgbImage image{width, height, std::vector<unsigned char>(static_cast<size_t>(width) * height * 3)};
+    for (UINT y = 0; y < height; ++y)
+    {
+        const auto* row = reinterpret_cast<const uint16_t*>(mapped + footprint.Offset +
+            static_cast<size_t>(y) * footprint.Footprint.RowPitch);
+        for (UINT x = 0; x < width; ++x)
+        {
+            const size_t sourceIndex = static_cast<size_t>(x) * 4;
+            const size_t targetIndex = (static_cast<size_t>(y) * width + x) * 3;
+            for (size_t channel = 0; channel < 3; ++channel)
+            {
+                const float value = DirectX::PackedVector::XMConvertHalfToFloat(row[sourceIndex + channel]);
+                image.pixels[targetIndex + channel] = static_cast<unsigned char>(
+                    (std::clamp)(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        }
+    }
+    D3D12_RANGE noWrite{0, 0};
+    readback->Unmap(0, &noWrite);
+    return image;
+}
+
 bool ExecuteAndWait(
     ID3D12Device* device,
     ID3D12CommandQueue* queue,
@@ -331,7 +580,9 @@ LRESULT CALLBACK ProbeWindowProcedure(HWND window, UINT message, WPARAM wParam, 
 bool RunSyntheticFrame(
     ID3D12Device* device,
     HMODULE core,
-    AllocateParameters allocateParameters)
+    AllocateParameters allocateParameters,
+    const RgbImage* inputImage,
+    const std::filesystem::path* outputPath)
 {
     const auto createFeature = Import<CreateFeature>(core, "NVSDK_NGX_D3D12_CreateFeature");
     const auto evaluateFeature = Import<EvaluateFeature>(core, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -342,8 +593,8 @@ bool RunSyntheticFrame(
         return false;
     }
 
-    constexpr UINT width = 640;
-    constexpr UINT height = 360;
+    const UINT width = inputImage != nullptr ? inputImage->width : 640;
+    const UINT height = inputImage != nullptr ? inputImage->height : 360;
     constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     D3D12_COMMAND_QUEUE_DESC queueDescription{};
@@ -413,33 +664,60 @@ bool RunSyntheticFrame(
     colorClear.Color[1] = 0.42f;
     colorClear.Color[2] = 0.72f;
     colorClear.Color[3] = 1.0f;
+    D3D12_CLEAR_VALUE depthClear{};
+    depthClear.Format = DXGI_FORMAT_R32_FLOAT;
+    D3D12_CLEAR_VALUE motionClear{};
+    motionClear.Format = DXGI_FORMAT_R16G16_FLOAT;
 
-    auto color = CreateTexture(
-        device, width, height, colorFormat,
-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        D3D12_RESOURCE_STATE_RENDER_TARGET,
-        &colorClear);
+    auto color = inputImage != nullptr
+        ? CreateTexture(
+            device, width, height, colorFormat,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST)
+        : CreateTexture(
+            device, width, height, colorFormat,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            &colorClear);
     auto output = CreateTexture(
         device, width, height, colorFormat,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto depth = CreateTexture(
         device, width, height, DXGI_FORMAT_R32_FLOAT,
-        D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        &depthClear);
     auto motion = CreateTexture(
         device, width, height, DXGI_FORMAT_R16G16_FLOAT,
-        D3D12_RESOURCE_FLAG_NONE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        &motionClear);
     if (!color || !output || !depth || !motion) return false;
 
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    ComPtr<ID3D12Resource> colorUpload;
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDescription{};
     rtvHeapDescription.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    rtvHeapDescription.NumDescriptors = 1;
-    ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    rtvHeapDescription.NumDescriptors = inputImage != nullptr ? 2 : 3;
     if (FAILED(device->CreateDescriptorHeap(&rtvHeapDescription, IID_PPV_ARGS(&rtvHeap)))) return false;
-    device->CreateRenderTargetView(color.Get(), nullptr, rtvHeap->GetCPUDescriptorHandleForHeapStart());
-    list->ClearRenderTargetView(rtvHeap->GetCPUDescriptorHandleForHeapStart(), colorClear.Color, 0, nullptr);
+    const UINT descriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    if (inputImage != nullptr)
+    {
+        if (!UploadRgbAsHalf(device, list.Get(), color.Get(), *inputImage, colorUpload)) return false;
+    }
+    else
+    {
+        device->CreateRenderTargetView(color.Get(), nullptr, rtv);
+        list->ClearRenderTargetView(rtv, colorClear.Color, 0, nullptr);
+        rtv.ptr += descriptorSize;
+    }
+    device->CreateRenderTargetView(depth.Get(), nullptr, rtv);
+    list->ClearRenderTargetView(rtv, depthClear.Color, 0, nullptr);
+    rtv.ptr += descriptorSize;
+    device->CreateRenderTargetView(motion.Get(), nullptr, rtv);
+    list->ClearRenderTargetView(rtv, motionClear.Color, 0, nullptr);
 
     NgxParameter* parameters = nullptr;
     if (allocateParameters(&parameters) != NgxSuccess || parameters == nullptr)
@@ -462,7 +740,7 @@ bool RunSyntheticFrame(
     DWORD exceptionCode = 0;
     const NgxResult createResult = SafeCreateFeature(
         createFeature, list.Get(), parameters, &handle, &exceptionCode);
-    std::cout << "Synthetic DLSS CreateFeature -> ";
+    std::cout << "DLSS transport CreateFeature -> ";
     if (exceptionCode != 0)
         std::cout << "exception 0x" << std::hex << exceptionCode << std::dec << '\n';
     else
@@ -472,13 +750,21 @@ bool RunSyntheticFrame(
 
     if (FAILED(allocator->Reset()) ||
         FAILED(list->Reset(allocator.Get(), nullptr))) return false;
-    D3D12_RESOURCE_BARRIER colorBarrier{};
-    colorBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    colorBarrier.Transition.pResource = color.Get();
-    colorBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    colorBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    colorBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    list->ResourceBarrier(1, &colorBarrier);
+    std::vector<D3D12_RESOURCE_BARRIER> guideBarriers;
+    auto addGuideBarrier = [&](ID3D12Resource* resource)
+    {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = resource;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        guideBarriers.push_back(barrier);
+    };
+    if (inputImage == nullptr) addGuideBarrier(color.Get());
+    addGuideBarrier(depth.Get());
+    addGuideBarrier(motion.Get());
+    list->ResourceBarrier(static_cast<UINT>(guideBarriers.size()), guideBarriers.data());
 
     parameters->Set("Color", color.Get());
     parameters->Set("Output", output.Get());
@@ -506,13 +792,25 @@ bool RunSyntheticFrame(
     exceptionCode = 0;
     const NgxResult evaluateResult = SafeEvaluateFeature(
         evaluateFeature, list.Get(), handle, parameters, &exceptionCode);
-    std::cout << "Synthetic DLSS EvaluateFeature -> ";
+    std::cout << "DLSS transport EvaluateFeature -> ";
     if (exceptionCode != 0)
         std::cout << "exception 0x" << std::hex << exceptionCode << std::dec << '\n';
     else
         std::cout << "NGX 0x" << std::hex << evaluateResult << std::dec << '\n';
     if (exceptionCode != 0 || evaluateResult != NgxSuccess) return false;
     if (!ExecuteAndWait(device, queue.Get(), list.Get())) return false;
+
+    if (outputPath != nullptr)
+    {
+        const auto resultImage = ReadHalfAsRgb(
+            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), width, height);
+        if (!resultImage || !SavePpm(*outputPath, *resultImage))
+        {
+            std::wcerr << L"Could not save processed frame: " << *outputPath << L'\n';
+            return false;
+        }
+        std::wcout << L"Processed frame: " << *outputPath << L'\n';
+    }
 
     if (releaseFeature != nullptr) releaseFeature(handle);
     swapchain.Reset();
@@ -528,10 +826,31 @@ int wmain(int argc, wchar_t** argv)
     std::wcout << std::unitbuf;
     std::wcerr << std::unitbuf;
 
-    if (argc < 2 || argc > 3)
+    if (argc < 2 || argc > 5)
     {
-        std::wcerr << L"Usage: ngx-capability-probe.exe <Streamline runtime directory> [--evaluate]\n";
+        std::wcerr
+            << L"Usage:\n"
+            << L"  ngx-capability-probe.exe <runtime> [--evaluate]\n"
+            << L"  ngx-capability-probe.exe <runtime> --frame <input.ppm> <output.ppm>\n";
         return 2;
+    }
+
+    const bool evaluateSynthetic = argc == 3 && std::wstring_view(argv[2]) == L"--evaluate";
+    const bool evaluateFrame = argc == 5 && std::wstring_view(argv[2]) == L"--frame";
+    if (argc != 2 && !evaluateSynthetic && !evaluateFrame)
+    {
+        std::wcerr << L"Invalid arguments. Use --evaluate or --frame <input.ppm> <output.ppm>.\n";
+        return 2;
+    }
+
+    std::optional<RgbImage> inputImage;
+    std::filesystem::path outputPath;
+    if (evaluateFrame)
+    {
+        inputImage = LoadPpm(std::filesystem::absolute(argv[3]));
+        if (!inputImage) return 2;
+        outputPath = std::filesystem::absolute(argv[4]);
+        std::wcout << L"Input frame: " << std::filesystem::absolute(argv[3]) << L'\n';
     }
 
     const auto runtimeDirectory = std::filesystem::absolute(argv[1]);
@@ -684,10 +1003,16 @@ int wmain(int argc, wchar_t** argv)
     PrintCapability(capabilities, "SuperSampling.MinDriverVersionMinor");
     PrintCapability(capabilities, "SuperSamplingDenoising.Available");
 
-    if (argc == 3 && std::wstring_view(argv[2]) == L"--evaluate")
+    if (evaluateSynthetic || evaluateFrame)
     {
-        const bool evaluated = RunSyntheticFrame(device.Get(), core, allocateParameters);
-        std::cout << "Synthetic frame: " << (evaluated ? "completed" : "failed") << '\n';
+        const bool evaluated = RunSyntheticFrame(
+            device.Get(),
+            core,
+            allocateParameters,
+            inputImage ? &*inputImage : nullptr,
+            evaluateFrame ? &outputPath : nullptr);
+        std::cout << (evaluateFrame ? "Input frame: " : "Synthetic frame: ")
+                  << (evaluated ? "completed" : "failed") << '\n';
         if (!evaluated) return 12;
     }
 

@@ -78,6 +78,15 @@ user-supplied Streamline ZIP, ReShade DLL, and Neural Rendering add-on:
 .\scripts\Invoke-NeuralProbe.ps1
 ```
 
+Once that succeeds, process one decoded frame from a normal, unprotected video:
+
+```powershell
+.\scripts\Invoke-NeuralFrame.ps1 `
+  -Video 'C:\path\to\video.mp4' `
+  -Timestamp '00:00:02' `
+  -Output 'C:\path\to\processed-frame.png'
+```
+
 ## Legal and safety boundaries
 
 - No NVIDIA DLLs, SDK files, model weights, or third-party binaries are stored
@@ -89,8 +98,9 @@ user-supplied Streamline ZIP, ReShade DLL, and Neural Rendering add-on:
 
 ## Status
 
-The project-local mpv launcher and RTX VSR A/B baseline are working. A synthetic
-D3D12 DLAA frame has also been intercepted by ReShade and processed successfully
-by hidden NGX feature 18 on an RTX 4090 using the user-supplied 310.8.0 runtime.
-The next milestone is replacing the synthetic colour/depth/motion textures with
-live video, estimated depth, and optical flow.
+The project-local mpv launcher and RTX VSR A/B baseline are working. Both a
+synthetic D3D12 texture and a decoded 960x540 video frame have been intercepted,
+processed by hidden NGX feature 18, and read back successfully on an RTX 4090
+using the user-supplied patched 310.8.0 runtime. Depth and motion are currently
+deterministic zero guides. The next milestone is replacing those placeholders
+with estimated depth and optical flow, then processing consecutive frames.

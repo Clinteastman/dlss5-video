@@ -2,6 +2,10 @@
 
 Checked 29 August 2026.
 
+See [nvidia-vfx-findings.md](nvidia-vfx-findings.md) for the official ComfyUI
+RTX node audit. It offers a useful CUDA/DLPack frame boundary, but its installed
+API is VSR-only; Neural Rendering remains in the supplied Streamline runtime.
+
 ## Finding
 
 There is no public project we found that combines live video playback, generated
