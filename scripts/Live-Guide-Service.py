@@ -131,7 +131,7 @@ def main() -> int:
 
     depth_size = args.depth_size
     flow_percent = round(args.flow_scale * 100)
-    flow_perf = NvidiaOpticalFlow.QUALITY
+    flow_perf = NvidiaOpticalFlow.FAST
     flow_width = max(32, round(args.width * flow_percent / 100))
     flow_height = max(16, round(args.height * flow_percent / 100))
     pixels = args.width * args.height

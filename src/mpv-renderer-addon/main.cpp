@@ -29,7 +29,7 @@ float neuralStrength = 1.0f;
 float depthHistory = 0.25f;
 int depthDetail = 2;
 int flowResolution = 2;
-int flowPerformance = 2;
+int flowPerformance = 0;
 constexpr std::array<uint32_t, 3> depthSizes = {280, 392, 518};
 constexpr std::array<uint32_t, 3> flowPercents = {25, 50, 100};
 constexpr std::array<uint32_t, 3> flowPerformanceLevels = {20, 10, 5};
@@ -221,6 +221,8 @@ void DrawSettings(reshade::api::effect_runtime*)
         "Optical-flow mode", &flowPerformance,
         flowPerformanceOptions.data(),
         static_cast<int>(flowPerformanceOptions.size()));
+    ImGui::TextDisabled(
+        "Quality mode may stall when full-resolution NVOF and NGX compete.");
 
     const double interval = frameMilliseconds.load(std::memory_order_relaxed);
     ImGui::Separator();

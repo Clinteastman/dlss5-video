@@ -148,13 +148,15 @@ dependencies:
 ```
 
 The default high-quality pipeline produces 1280x720 guides, runs the depth model
-internally at 518x518, runs NVIDIA Optical Flow at 1280x720 in Quality mode, and
+internally at 518x518, runs NVIDIA Optical Flow at 1280x720 in Fast mode, and
 asks NGX for a 1920x1080 output. The ReShade panel can switch depth between 280,
 392, and 518 pixels, flow between quarter, half, and full resolution, and flow
 mode between Fast, Balanced, and Quality while the video keeps playing. It also
 shows the current guide-processing time. `-InputWidth`, `-InputHeight`,
 `-DepthSize`, `-WindowWidth`, and `-WindowHeight` expose the launch-time
-trade-offs. Use `-Loop` for short test clips.
+trade-offs. Quality flow mode is experimental because full-resolution NVOF and
+NGX can stall one another on the current driver. Use `-Loop` for short test
+clips.
 
 Precompute guides from decoded image frames, then pack them into the stream read
 by the live add-on:
