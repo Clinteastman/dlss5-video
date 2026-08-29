@@ -53,10 +53,25 @@ struct LiveGuideHeader
     uint32_t processingMicroseconds;
     uint64_t generatedCount;
 };
+
+struct LiveGuideControl
+{
+    char magic[4];
+    uint32_t version;
+    volatile LONG depthSize;
+    volatile LONG flowPercent;
+    volatile LONG flowPerformance;
+    volatile LONG requestSequence;
+    volatile LONG appliedSequence;
+    volatile LONG activeFlowWidth;
+    volatile LONG activeFlowHeight;
+    uint32_t reserved;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(GuidePackHeader) == 36);
 static_assert(sizeof(LiveGuideHeader) == 64);
+static_assert(sizeof(LiveGuideControl) == 40);
 
 struct NgxParameter
 {
@@ -164,6 +179,8 @@ struct Session
     HANDLE liveMapping = nullptr;
     uint8_t* liveData = nullptr;
     uint64_t liveSize = 0;
+    HANDLE controlMapping = nullptr;
+    LiveGuideControl* controlData = nullptr;
     uint64_t publishedSequence = 0;
     uint64_t consumedSequence = 0;
     uint64_t droppedFrames = 0;
@@ -465,8 +482,10 @@ void reset_transport()
     session.motionUploadData = nullptr;
     if (session.guideData != nullptr) UnmapViewOfFile(session.guideData);
     if (session.liveData != nullptr) UnmapViewOfFile(session.liveData);
+    if (session.controlData != nullptr) UnmapViewOfFile(session.controlData);
     if (session.guideMapping != nullptr) CloseHandle(session.guideMapping);
     if (session.liveMapping != nullptr) CloseHandle(session.liveMapping);
+    if (session.controlMapping != nullptr) CloseHandle(session.controlMapping);
     if (session.guideFile != INVALID_HANDLE_VALUE) CloseHandle(session.guideFile);
     if (session.colorShared != nullptr) CloseHandle(session.colorShared);
     if (session.outputShared != nullptr) CloseHandle(session.outputShared);
@@ -578,6 +597,25 @@ bool open_live_guides(uint32_t width, uint32_t height)
         header->height = height;
         header->frameBytes = static_cast<uint32_t>(frameBytes);
         header->guideBytes = static_cast<uint32_t>(guideBytes);
+    }
+    session.controlMapping = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+        sizeof(LiveGuideControl), L"Local\\DLSS5VideoGuideControl");
+    if (session.controlMapping == nullptr) return false;
+    session.controlData = static_cast<LiveGuideControl*>(MapViewOfFile(
+        session.controlMapping, FILE_MAP_ALL_ACCESS, 0, 0,
+        sizeof(LiveGuideControl)));
+    if (session.controlData == nullptr) return false;
+    if (std::memcmp(session.controlData->magic, "D5LC", 4) != 0 ||
+        session.controlData->version != 1)
+    {
+        std::memset(session.controlData, 0, sizeof(LiveGuideControl));
+        std::memcpy(session.controlData->magic, "D5LC", 4);
+        session.controlData->version = 1;
+        session.controlData->depthSize = 392;
+        session.controlData->flowPercent = 50;
+        session.controlData->flowPerformance = 20;
+        session.controlData->requestSequence = 1;
     }
     session.liveDepth.resize(static_cast<size_t>(pixels));
     session.liveMotion.resize(static_cast<size_t>(pixels) * 2);
@@ -951,35 +989,45 @@ bool show_guide_preview(ID3D11Texture2D* backBuffer, int debugView)
             frame + sizeof(uint32_t) +
             static_cast<uint64_t>(session.width) * session.height * sizeof(float));
     }
-    const size_t pixels = static_cast<size_t>(session.width) * session.height;
-    for (size_t index = 0; index < pixels; ++index)
+    for (uint32_t y = 0; y < session.outputHeight; ++y)
     {
-        if (debugView == 2)
+        const uint32_t sourceY = std::min(
+            static_cast<uint32_t>(
+                static_cast<uint64_t>(y) * session.height / session.outputHeight),
+            session.height - 1);
+        for (uint32_t x = 0; x < session.outputWidth; ++x)
         {
-            const float value = std::clamp(depth[index], 0.0f, 1.0f);
-            session.guidePreview[index] = pack_preview_pixel(value, value, value);
-        }
-        else
-        {
-            const float x = half_to_float(motion[index * 2]);
-            const float y = half_to_float(motion[index * 2 + 1]);
-            const float magnitude = std::sqrt(x * x + y * y);
-            session.guidePreview[index] = pack_preview_pixel(
-                0.5f + x / 64.0f,
-                0.5f + y / 64.0f,
-                magnitude / 32.0f);
+            const uint32_t sourceX = std::min(
+                static_cast<uint32_t>(
+                    static_cast<uint64_t>(x) * session.width / session.outputWidth),
+                session.width - 1);
+            const size_t sourceIndex =
+                static_cast<size_t>(sourceY) * session.width + sourceX;
+            const size_t outputIndex =
+                static_cast<size_t>(y) * session.outputWidth + x;
+            if (debugView == 2)
+            {
+                const float value = std::clamp(depth[sourceIndex], 0.0f, 1.0f);
+                session.guidePreview[outputIndex] =
+                    pack_preview_pixel(value, value, value);
+            }
+            else
+            {
+                const float motionX = half_to_float(motion[sourceIndex * 2]);
+                const float motionY = half_to_float(motion[sourceIndex * 2 + 1]);
+                const float magnitude =
+                    std::sqrt(motionX * motionX + motionY * motionY);
+                session.guidePreview[outputIndex] = pack_preview_pixel(
+                    0.5f + motionX / 64.0f,
+                    0.5f + motionY / 64.0f,
+                    magnitude / 32.0f);
+            }
         }
     }
     session.context11->UpdateSubresource(
         session.guidePreview11.Get(), 0, nullptr,
-        session.guidePreview.data(), session.width * sizeof(uint32_t), 0);
-    if (session.width == session.outputWidth &&
-        session.height == session.outputHeight)
-        session.context11->CopyResource(backBuffer, session.guidePreview11.Get());
-    else if (!scale_d3d11_texture(
-            session.guidePreview11.Get(), backBuffer,
-            session.previewScalerEnumerator.Get(), session.previewScaler.Get()))
-        return false;
+        session.guidePreview.data(), session.outputWidth * sizeof(uint32_t), 0);
+    session.context11->CopyResource(backBuffer, session.guidePreview11.Get());
     return wait_for_d3d11_copy();
 }
 
@@ -1203,21 +1251,21 @@ bool initialize(
         }
 
         D3D11_TEXTURE2D_DESC previewDesc{};
-        previewDesc.Width = width;
-        previewDesc.Height = height;
+        previewDesc.Width = backBufferWidth;
+        previewDesc.Height = backBufferHeight;
         previewDesc.MipLevels = 1;
         previewDesc.ArraySize = 1;
         previewDesc.Format = backBufferFormat;
         previewDesc.SampleDesc.Count = 1;
         previewDesc.Usage = D3D11_USAGE_DEFAULT;
-        previewDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(hostDevice->CreateTexture2D(
                 &previewDesc, nullptr, &session.guidePreview11)))
         {
             log_error("DLSS 5 Video Renderer could not create its guide preview texture.");
             return false;
         }
-        session.guidePreview.resize(static_cast<size_t>(width) * height);
+        session.guidePreview.resize(
+            static_cast<size_t>(backBufferWidth) * backBufferHeight);
 
         if (session.liveGuides)
         {
@@ -1519,6 +1567,44 @@ uint32_t guide_frame_count()
             header->generatedCount, std::numeric_limits<uint32_t>::max()));
     }
     return session.guideHeader.frameCount;
+}
+void set_guide_quality(
+    uint32_t depthSize,
+    uint32_t flowPercent,
+    uint32_t flowPerformance)
+{
+    LiveGuideControl* const control = session.controlData;
+    if (control == nullptr ||
+        (depthSize != 280 && depthSize != 392 && depthSize != 518) ||
+        (flowPercent != 25 && flowPercent != 50 && flowPercent != 100) ||
+        (flowPerformance != 5 && flowPerformance != 10 && flowPerformance != 20))
+        return;
+    if (static_cast<uint32_t>(control->depthSize) == depthSize &&
+        static_cast<uint32_t>(control->flowPercent) == flowPercent &&
+        static_cast<uint32_t>(control->flowPerformance) == flowPerformance)
+        return;
+    InterlockedExchange(&control->depthSize, static_cast<LONG>(depthSize));
+    InterlockedExchange(&control->flowPercent, static_cast<LONG>(flowPercent));
+    InterlockedExchange(
+        &control->flowPerformance, static_cast<LONG>(flowPerformance));
+    InterlockedIncrement(&control->requestSequence);
+}
+double guide_processing_milliseconds()
+{
+    if (session.liveData == nullptr) return 0.0;
+    const auto* const header =
+        reinterpret_cast<const LiveGuideHeader*>(session.liveData);
+    return static_cast<double>(header->processingMicroseconds) / 1000.0;
+}
+uint32_t active_flow_width()
+{
+    return session.controlData == nullptr ? 0 :
+        static_cast<uint32_t>(session.controlData->activeFlowWidth);
+}
+uint32_t active_flow_height()
+{
+    return session.controlData == nullptr ? 0 :
+        static_cast<uint32_t>(session.controlData->activeFlowHeight);
 }
 const char* guide_status() { return session.guideState.c_str(); }
 const char* guide_binding_status() { return session.guideBindingState.c_str(); }

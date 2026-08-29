@@ -24,6 +24,13 @@ bool evaluate_transport(
 uint64_t evaluation_count();
 uint32_t guide_frame_index();
 uint32_t guide_frame_count();
+void set_guide_quality(
+    uint32_t depthSize,
+    uint32_t flowPercent,
+    uint32_t flowPerformance);
+double guide_processing_milliseconds();
+uint32_t active_flow_width();
+uint32_t active_flow_height();
 const char* guide_status();
 const char* guide_binding_status();
 const char* status();

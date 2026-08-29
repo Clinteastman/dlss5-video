@@ -154,10 +154,18 @@ class NvidiaOpticalFlow:
     SHORT2 = 5
     DEVICE_POINTER = 2
     OPTICAL_FLOW = 1
+    QUALITY = 5
+    BALANCED = 10
     FAST = 20
     CAP_OUTPUT_GRIDS = 0
 
-    def __init__(self, width: int, height: int, device: int = 0) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        device: int = 0,
+        perf_level: int = FAST,
+    ) -> None:
         if os.name != "nt":
             raise RuntimeError("This NVIDIA Optical Flow wrapper currently supports Windows only.")
         self.width = width
@@ -192,7 +200,7 @@ class NvidiaOpticalFlow:
         params.height = height
         params.out_grid_size = 1
         params.mode = self.OPTICAL_FLOW
-        params.perf_level = self.FAST
+        params.perf_level = perf_level
         _check(self.api.initialize(self.session, ctypes.byref(params)), "initialize session")
 
         self.current = self._create_buffer(width, height, self.INPUT, self.ABGR8)

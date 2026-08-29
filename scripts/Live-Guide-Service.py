@@ -20,7 +20,9 @@ from NvidiaOpticalFlow import NvidiaOpticalFlow
 
 MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 MAPPING_NAME = "Local\\DLSS5VideoLiveGuides"
+CONTROL_MAPPING_NAME = "Local\\DLSS5VideoGuideControl"
 HEADER = struct.Struct("<4sIIIIIIIqqIIQ")
+CONTROL = struct.Struct("<4sIIIIIIIII")
 INPUT_STATE = 24
 OUTPUT_STATE = 28
 INPUT_SEQUENCE = 32
@@ -28,6 +30,13 @@ OUTPUT_SEQUENCE = 40
 RESET = 48
 PROCESSING_US = 52
 GENERATED_COUNT = 56
+CONTROL_DEPTH_SIZE = 8
+CONTROL_FLOW_PERCENT = 12
+CONTROL_FLOW_PERF = 16
+CONTROL_REQUEST_SEQUENCE = 20
+CONTROL_APPLIED_SEQUENCE = 24
+CONTROL_ACTIVE_FLOW_WIDTH = 28
+CONTROL_ACTIVE_FLOW_HEIGHT = 32
 
 
 def set_u32(mapping: mmap.mmap, offset: int, value: int) -> None:
@@ -44,6 +53,32 @@ def get_u32(mapping: mmap.mmap, offset: int) -> int:
 
 def get_u64(mapping: mmap.mmap, offset: int) -> int:
     return struct.unpack_from("<Q", mapping, offset)[0]
+
+
+def initialise_control(
+    control: mmap.mmap,
+    depth_size: int,
+    flow_percent: int,
+    flow_perf: int,
+) -> None:
+    current = CONTROL.unpack_from(control, 0)
+    if current[0] == b"D5LC" and current[1] == 1:
+        return
+    control[:] = bytes(CONTROL.size)
+    CONTROL.pack_into(
+        control,
+        0,
+        b"D5LC",
+        1,
+        depth_size,
+        flow_percent,
+        flow_perf,
+        1,
+        0,
+        0,
+        0,
+        0,
+    )
 
 
 def estimate_depth(
@@ -75,8 +110,8 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--model-cache", required=True, type=Path)
-    parser.add_argument("--flow-scale", type=float, default=0.5)
-    parser.add_argument("--depth-size", type=int, default=392)
+    parser.add_argument("--flow-scale", type=float, default=1.0)
+    parser.add_argument("--depth-size", type=int, default=518)
     parser.add_argument("--depth-history", type=float, default=0.25)
     parser.add_argument("--depth-range-history", type=float, default=0.95)
     parser.add_argument("--scene-cut-threshold", type=float, default=0.20)
@@ -94,13 +129,20 @@ def main() -> int:
         MODEL_ID, cache_dir=args.model_cache, dtype=torch.float16
     ).to(device).eval()
 
-    flow_width = max(32, round(args.width * args.flow_scale))
-    flow_height = max(16, round(args.height * args.flow_scale))
+    depth_size = args.depth_size
+    flow_percent = round(args.flow_scale * 100)
+    flow_perf = NvidiaOpticalFlow.QUALITY
+    flow_width = max(32, round(args.width * flow_percent / 100))
+    flow_height = max(16, round(args.height * flow_percent / 100))
     pixels = args.width * args.height
     frame_bytes = pixels * 4
     guide_bytes = pixels * 8
     mapping_size = HEADER.size + frame_bytes + guide_bytes
     mapping = mmap.mmap(-1, mapping_size, MAPPING_NAME, access=mmap.ACCESS_WRITE)
+    control = mmap.mmap(
+        -1, CONTROL.size, CONTROL_MAPPING_NAME, access=mmap.ACCESS_WRITE
+    )
+    initialise_control(control, depth_size, flow_percent, flow_perf)
     current = HEADER.unpack_from(mapping, 0)
     if (
         current[0] != b"D5LV"
@@ -138,24 +180,87 @@ def main() -> int:
     depth_low: float | None = None
     depth_high: float | None = None
     generated = 0
+    nvof: NvidiaOpticalFlow | None = None
     try:
         estimate_depth(
             np.zeros((args.height, args.width, 3), dtype=np.uint8),
             processor,
             model,
             device,
-            args.depth_size,
+            depth_size,
         )
-        with NvidiaOpticalFlow(flow_width, flow_height) as nvof:
-            print(
-                f"Live guides ready: {args.width}x{args.height} depth, "
-                f"NVOF Fast {flow_width}x{flow_height}",
-                flush=True,
-            )
-            while args.max_frames == 0 or generated < args.max_frames:
+        nvof = NvidiaOpticalFlow(
+            flow_width, flow_height, perf_level=flow_perf
+        )
+        set_u32(control, CONTROL_ACTIVE_FLOW_WIDTH, flow_width)
+        set_u32(control, CONTROL_ACTIVE_FLOW_HEIGHT, flow_height)
+        set_u32(
+            control,
+            CONTROL_APPLIED_SEQUENCE,
+            get_u32(control, CONTROL_REQUEST_SEQUENCE),
+        )
+        print(
+            f"Live guides ready: {args.width}x{args.height} output, "
+            f"depth {depth_size}, NVOF {flow_width}x{flow_height} perf {flow_perf}",
+            flush=True,
+        )
+        while args.max_frames == 0 or generated < args.max_frames:
                 if get_u32(mapping, INPUT_STATE) != 2:
                     time.sleep(0.001)
                     continue
+
+                requested_sequence = get_u32(
+                    control, CONTROL_REQUEST_SEQUENCE
+                )
+                if requested_sequence != get_u32(
+                    control, CONTROL_APPLIED_SEQUENCE
+                ):
+                    requested_depth = get_u32(control, CONTROL_DEPTH_SIZE)
+                    requested_flow_percent = get_u32(
+                        control, CONTROL_FLOW_PERCENT
+                    )
+                    requested_flow_perf = get_u32(control, CONTROL_FLOW_PERF)
+                    if requested_depth in (280, 392, 518):
+                        depth_size = requested_depth
+                    if requested_flow_percent in (25, 50, 100):
+                        flow_percent = requested_flow_percent
+                    if requested_flow_perf in (
+                        NvidiaOpticalFlow.QUALITY,
+                        NvidiaOpticalFlow.BALANCED,
+                        NvidiaOpticalFlow.FAST,
+                    ):
+                        flow_perf = requested_flow_perf
+                    new_flow_width = max(
+                        32, round(args.width * flow_percent / 100)
+                    )
+                    new_flow_height = max(
+                        16, round(args.height * flow_percent / 100)
+                    )
+                    nvof.close()
+                    nvof = NvidiaOpticalFlow(
+                        new_flow_width,
+                        new_flow_height,
+                        perf_level=flow_perf,
+                    )
+                    flow_width = new_flow_width
+                    flow_height = new_flow_height
+                    previous_gray = None
+                    previous_depth = None
+                    previous_flow_frame = None
+                    depth_low = None
+                    depth_high = None
+                    set_u32(control, CONTROL_ACTIVE_FLOW_WIDTH, flow_width)
+                    set_u32(control, CONTROL_ACTIVE_FLOW_HEIGHT, flow_height)
+                    set_u32(
+                        control,
+                        CONTROL_APPLIED_SEQUENCE,
+                        requested_sequence,
+                    )
+                    print(
+                        f"Guide settings applied: depth {depth_size}, "
+                        f"NVOF {flow_width}x{flow_height} perf {flow_perf}",
+                        flush=True,
+                    )
                 sequence = get_u64(mapping, INPUT_SEQUENCE)
                 frame = np.frombuffer(
                     mapping[HEADER.size : HEADER.size + frame_bytes],
@@ -174,7 +279,7 @@ def main() -> int:
                     reset = reset or difference >= args.scene_cut_threshold
 
                 raw_depth = estimate_depth(
-                    rgb, processor, model, device, args.depth_size
+                    rgb, processor, model, device, depth_size
                 )
                 frame_low, frame_high = np.percentile(raw_depth, (2.0, 98.0))
                 if reset or depth_low is None or depth_high is None:
@@ -263,6 +368,9 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if nvof is not None:
+            nvof.close()
+        control.close()
         mapping.close()
     return 0
 

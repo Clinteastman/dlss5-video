@@ -132,6 +132,8 @@ The add-on currently provides:
 - depth and motion-vector preview views;
 - real-time Depth Anything and NVIDIA Optical Flow guides delivered by a
   non-blocking companion process;
+- live ReShade controls for depth detail, optical-flow resolution, and NVIDIA
+  Optical Flow quality/performance mode, with measured guide time;
 - direct local-file and YouTube URL playback through the live launcher;
 - live window-resize rebuilding, with the guide resolution as the NGX input and
   a larger window as the genuine NGX output; and
@@ -145,10 +147,14 @@ dependencies:
 .\scripts\Start-LiveVideo.ps1 'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-The default pipeline produces 960x540 guides, runs the depth model internally at
-392x392, runs NVIDIA Optical Flow at 480x270, and asks NGX for a 1920x1080
-output. `-InputWidth`, `-InputHeight`, `-DepthSize`, `-WindowWidth`, and
-`-WindowHeight` expose those trade-offs. Use `-Loop` for short test clips.
+The default high-quality pipeline produces 1280x720 guides, runs the depth model
+internally at 518x518, runs NVIDIA Optical Flow at 1280x720 in Quality mode, and
+asks NGX for a 1920x1080 output. The ReShade panel can switch depth between 280,
+392, and 518 pixels, flow between quarter, half, and full resolution, and flow
+mode between Fast, Balanced, and Quality while the video keeps playing. It also
+shows the current guide-processing time. `-InputWidth`, `-InputHeight`,
+`-DepthSize`, `-WindowWidth`, and `-WindowHeight` expose the launch-time
+trade-offs. Use `-Loop` for short test clips.
 
 Precompute guides from decoded image frames, then pack them into the stream read
 by the live add-on:

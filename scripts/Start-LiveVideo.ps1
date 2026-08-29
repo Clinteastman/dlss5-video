@@ -4,10 +4,10 @@ param(
     [string]$Source,
 
     [ValidateRange(320, 1920)]
-    [int]$InputWidth = 960,
+    [int]$InputWidth = 1280,
 
     [ValidateRange(180, 1080)]
-    [int]$InputHeight = 540,
+    [int]$InputHeight = 720,
 
     [ValidateRange(640, 7680)]
     [int]$WindowWidth = 1920,
@@ -16,7 +16,7 @@ param(
     [int]$WindowHeight = 1080,
 
     [ValidateRange(280, 518)]
-    [int]$DepthSize = 392,
+    [int]$DepthSize = 518,
 
     [switch]$Loop
 )
@@ -105,6 +105,7 @@ try {
     )
     if ($isUrl -and (Test-Path -LiteralPath $ytDlp -PathType Leaf)) {
         $arguments += "--script-opts=ytdl_hook-ytdl_path=$ytDlp"
+        $arguments += '--ytdl-format=bestvideo+bestaudio/best'
     }
     if ($Loop) {
         $arguments += '--loop-file=inf'

@@ -27,6 +27,12 @@ bool frozenFrameReady = false;
 int debugView = 0;
 float neuralStrength = 1.0f;
 float depthHistory = 0.25f;
+int depthDetail = 2;
+int flowResolution = 2;
+int flowPerformance = 2;
+constexpr std::array<uint32_t, 3> depthSizes = {280, 392, 518};
+constexpr std::array<uint32_t, 3> flowPercents = {25, 50, 100};
+constexpr std::array<uint32_t, 3> flowPerformanceLevels = {20, 10, 5};
 reshade::api::resource frameCopy = {};
 reshade::api::device* frameCopyDevice = nullptr;
 uint32_t frameCopyWidth = 0;
@@ -79,6 +85,10 @@ void OnPresent(
             rendererEnabled && debugView == 0,
             debugView, presentIndex, freezeFrame,
             useEstimatedDepth, useEstimatedMotion, reverseEstimatedDepth);
+        live_ngx::set_guide_quality(
+            depthSizes[depthDetail],
+            flowPercents[flowResolution],
+            flowPerformanceLevels[flowPerformance]);
     }
 }
 
@@ -189,6 +199,29 @@ void DrawSettings(reshade::api::effect_runtime*)
     ImGui::SliderFloat("Neural strength", &neuralStrength, 0.0f, 1.5f, "%.2f");
     ImGui::SliderFloat("Depth history", &depthHistory, 0.0f, 0.9f, "%.2f");
 
+    ImGui::Separator();
+    ImGui::TextUnformatted("Live guide quality");
+    constexpr std::array<const char*, 3> depthOptions = {
+        "Fast (280)", "Balanced (392)", "High (518)"
+    };
+    constexpr std::array<const char*, 3> flowResolutionOptions = {
+        "Quarter resolution", "Half resolution", "Full resolution"
+    };
+    constexpr std::array<const char*, 3> flowPerformanceOptions = {
+        "Fast", "Balanced", "Quality"
+    };
+    ImGui::Combo(
+        "Depth resolution", &depthDetail,
+        depthOptions.data(), static_cast<int>(depthOptions.size()));
+    ImGui::Combo(
+        "Optical-flow resolution", &flowResolution,
+        flowResolutionOptions.data(),
+        static_cast<int>(flowResolutionOptions.size()));
+    ImGui::Combo(
+        "Optical-flow mode", &flowPerformance,
+        flowPerformanceOptions.data(),
+        static_cast<int>(flowPerformanceOptions.size()));
+
     const double interval = frameMilliseconds.load(std::memory_order_relaxed);
     ImGui::Separator();
     ImGui::Text("Presented frames: %llu", frameCount.load(std::memory_order_relaxed));
@@ -199,6 +232,15 @@ void DrawSettings(reshade::api::effect_runtime*)
     ImGui::TextWrapped("Guides: %s", live_ngx::guide_status());
     ImGui::TextWrapped("NGX guide binding: %s", live_ngx::guide_binding_status());
     ImGui::TextWrapped("Status: %s", live_ngx::status());
+    const double guideMilliseconds = live_ngx::guide_processing_milliseconds();
+    if (guideMilliseconds > 0.0)
+        ImGui::Text(
+            "Guide processing: %.1f ms (%.1f fps)",
+            guideMilliseconds, 1000.0 / guideMilliseconds);
+    const uint32_t flowWidth = live_ngx::active_flow_width();
+    const uint32_t flowHeight = live_ngx::active_flow_height();
+    if (flowWidth != 0 && flowHeight != 0)
+        ImGui::Text("Active optical flow: %ux%u", flowWidth, flowHeight);
     if (interval > 0.0)
         ImGui::Text("Present interval: %.2f ms (%.1f fps)", interval, 1000.0 / interval);
     ImGui::TextDisabled("Freeze holds the source frame while mpv keeps the UI alive.");
