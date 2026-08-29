@@ -577,12 +577,12 @@ LRESULT CALLBACK ProbeWindowProcedure(HWND window, UINT message, WPARAM wParam, 
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-bool RunSyntheticFrame(
+bool RunFrameSession(
     ID3D12Device* device,
     HMODULE core,
     AllocateParameters allocateParameters,
-    const RgbImage* inputImage,
-    const std::filesystem::path* outputPath)
+    const std::vector<std::filesystem::path>& inputPaths,
+    const std::vector<std::filesystem::path>& outputPaths)
 {
     const auto createFeature = Import<CreateFeature>(core, "NVSDK_NGX_D3D12_CreateFeature");
     const auto evaluateFeature = Import<EvaluateFeature>(core, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -593,6 +593,13 @@ bool RunSyntheticFrame(
         return false;
     }
 
+    std::optional<RgbImage> firstImage;
+    if (!inputPaths.empty())
+    {
+        firstImage = LoadPpm(inputPaths.front());
+        if (!firstImage) return false;
+    }
+    const RgbImage* inputImage = firstImage ? &*firstImage : nullptr;
     const UINT width = inputImage != nullptr ? inputImage->width : 640;
     const UINT height = inputImage != nullptr ? inputImage->height : 360;
     constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -800,16 +807,81 @@ bool RunSyntheticFrame(
     if (exceptionCode != 0 || evaluateResult != NgxSuccess) return false;
     if (!ExecuteAndWait(device, queue.Get(), list.Get())) return false;
 
-    if (outputPath != nullptr)
+    if (!outputPaths.empty())
     {
         const auto resultImage = ReadHalfAsRgb(
             device, queue.Get(), allocator.Get(), list.Get(), output.Get(), width, height);
-        if (!resultImage || !SavePpm(*outputPath, *resultImage))
+        if (!resultImage || !SavePpm(outputPaths.front(), *resultImage))
         {
-            std::wcerr << L"Could not save processed frame: " << *outputPath << L'\n';
+            std::wcerr << L"Could not save processed frame: " << outputPaths.front() << L'\n';
             return false;
         }
-        std::wcout << L"Processed frame: " << *outputPath << L'\n';
+        std::wcout << L"Processed frame 1/" << inputPaths.size()
+                   << L": " << outputPaths.front() << L'\n';
+    }
+
+    for (size_t frameIndex = 1; frameIndex < inputPaths.size(); ++frameIndex)
+    {
+        const auto frame = LoadPpm(inputPaths[frameIndex]);
+        if (!frame || frame->width != width || frame->height != height)
+        {
+            std::wcerr << L"Every sequence frame must have the same dimensions: "
+                       << inputPaths[frameIndex] << L'\n';
+            return false;
+        }
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
+
+        D3D12_RESOURCE_BARRIER reuseBarriers[2]{};
+        reuseBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        reuseBarriers[0].Transition.pResource = color.Get();
+        reuseBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        reuseBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        reuseBarriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        reuseBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        reuseBarriers[1].Transition.pResource = output.Get();
+        reuseBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        reuseBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        reuseBarriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        list->ResourceBarrier(2, reuseBarriers);
+
+        ComPtr<ID3D12Resource> frameUpload;
+        if (!UploadRgbAsHalf(device, list.Get(), color.Get(), *frame, frameUpload)) return false;
+        parameters->Set("Reset", 0);
+
+        exceptionCode = 0;
+        const NgxResult frameResult = SafeEvaluateFeature(
+            evaluateFeature, list.Get(), handle, parameters, &exceptionCode);
+        if (exceptionCode != 0 || frameResult != NgxSuccess)
+        {
+            std::cerr << "DLSS transport failed on frame " << frameIndex + 1 << ": ";
+            if (exceptionCode != 0)
+                std::cerr << "exception 0x" << std::hex << exceptionCode << std::dec << '\n';
+            else
+                std::cerr << "NGX 0x" << std::hex << frameResult << std::dec << '\n';
+            return false;
+        }
+        if (!ExecuteAndWait(device, queue.Get(), list.Get())) return false;
+
+        const auto resultImage = ReadHalfAsRgb(
+            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), width, height);
+        if (!resultImage || frameIndex >= outputPaths.size() ||
+            !SavePpm(outputPaths[frameIndex], *resultImage))
+        {
+            std::wcerr << L"Could not save processed frame: "
+                       << (frameIndex < outputPaths.size() ? outputPaths[frameIndex] : L"missing path")
+                       << L'\n';
+            return false;
+        }
+
+        swapchain->Present(0, 0);
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        std::wcout << L"Processed frame " << frameIndex + 1 << L'/' << inputPaths.size()
+                   << L": " << outputPaths[frameIndex] << L'\n';
     }
 
     if (releaseFeature != nullptr) releaseFeature(handle);
@@ -831,26 +903,53 @@ int wmain(int argc, wchar_t** argv)
         std::wcerr
             << L"Usage:\n"
             << L"  ngx-capability-probe.exe <runtime> [--evaluate]\n"
-            << L"  ngx-capability-probe.exe <runtime> --frame <input.ppm> <output.ppm>\n";
+            << L"  ngx-capability-probe.exe <runtime> --frame <input.ppm> <output.ppm>\n"
+            << L"  ngx-capability-probe.exe <runtime> --sequence <input-dir> <output-dir>\n";
         return 2;
     }
 
     const bool evaluateSynthetic = argc == 3 && std::wstring_view(argv[2]) == L"--evaluate";
     const bool evaluateFrame = argc == 5 && std::wstring_view(argv[2]) == L"--frame";
-    if (argc != 2 && !evaluateSynthetic && !evaluateFrame)
+    const bool evaluateSequence = argc == 5 && std::wstring_view(argv[2]) == L"--sequence";
+    if (argc != 2 && !evaluateSynthetic && !evaluateFrame && !evaluateSequence)
     {
-        std::wcerr << L"Invalid arguments. Use --evaluate or --frame <input.ppm> <output.ppm>.\n";
+        std::wcerr << L"Invalid arguments. Use --evaluate, --frame, or --sequence.\n";
         return 2;
     }
 
-    std::optional<RgbImage> inputImage;
-    std::filesystem::path outputPath;
+    std::vector<std::filesystem::path> inputPaths;
+    std::vector<std::filesystem::path> outputPaths;
     if (evaluateFrame)
     {
-        inputImage = LoadPpm(std::filesystem::absolute(argv[3]));
-        if (!inputImage) return 2;
-        outputPath = std::filesystem::absolute(argv[4]);
-        std::wcout << L"Input frame: " << std::filesystem::absolute(argv[3]) << L'\n';
+        inputPaths.push_back(std::filesystem::absolute(argv[3]));
+        outputPaths.push_back(std::filesystem::absolute(argv[4]));
+        std::wcout << L"Input frame: " << inputPaths.front() << L'\n';
+    }
+    else if (evaluateSequence)
+    {
+        const auto inputDirectory = std::filesystem::absolute(argv[3]);
+        const auto outputDirectory = std::filesystem::absolute(argv[4]);
+        if (!std::filesystem::is_directory(inputDirectory) ||
+            !std::filesystem::is_directory(outputDirectory))
+        {
+            std::wcerr << L"Both sequence paths must be existing directories.\n";
+            return 2;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(inputDirectory))
+        {
+            if (entry.is_regular_file() && entry.path().extension() == L".ppm")
+                inputPaths.push_back(entry.path());
+        }
+        std::sort(inputPaths.begin(), inputPaths.end());
+        if (inputPaths.empty())
+        {
+            std::wcerr << L"The sequence directory contains no .ppm frames.\n";
+            return 2;
+        }
+        for (const auto& inputPath : inputPaths)
+            outputPaths.push_back(outputDirectory / inputPath.filename());
+        std::wcout << L"Input sequence: " << inputPaths.size() << L" frames from "
+                   << inputDirectory << L'\n';
     }
 
     const auto runtimeDirectory = std::filesystem::absolute(argv[1]);
@@ -1003,15 +1102,16 @@ int wmain(int argc, wchar_t** argv)
     PrintCapability(capabilities, "SuperSampling.MinDriverVersionMinor");
     PrintCapability(capabilities, "SuperSamplingDenoising.Available");
 
-    if (evaluateSynthetic || evaluateFrame)
+    if (evaluateSynthetic || evaluateFrame || evaluateSequence)
     {
-        const bool evaluated = RunSyntheticFrame(
+        const bool evaluated = RunFrameSession(
             device.Get(),
             core,
             allocateParameters,
-            inputImage ? &*inputImage : nullptr,
-            evaluateFrame ? &outputPath : nullptr);
-        std::cout << (evaluateFrame ? "Input frame: " : "Synthetic frame: ")
+            inputPaths,
+            outputPaths);
+        std::cout << (evaluateSequence ? "Input sequence: " :
+                      (evaluateFrame ? "Input frame: " : "Synthetic frame: "))
                   << (evaluated ? "completed" : "failed") << '\n';
         if (!evaluated) return 12;
     }

@@ -6,6 +6,13 @@ See [nvidia-vfx-findings.md](nvidia-vfx-findings.md) for the official ComfyUI
 RTX node audit. It offers a useful CUDA/DLPack frame boundary, but its installed
 API is VSR-only; Neural Rendering remains in the supplied Streamline runtime.
 
+Local visual tests use uncommitted clips from Wikimedia Commons, including the
+Blender Foundation's [*Tears of Steel*](https://commons.wikimedia.org/wiki/File:Tears_of_Steel_in_4k_-_Official_Blender_Foundation_release.webm)
+for human faces and an Xbox Mexico [*Dishonored 2* montage](https://commons.wikimedia.org/wiki/File:Dishonored_2_gameplay_clip.webm)
+for game-rendered surfaces. Both source pages identify the specific clips as CC
+BY 3.0. The media files and generated comparisons are not stored in this
+repository.
+
 ## Finding
 
 There is no public project we found that combines live video playback, generated

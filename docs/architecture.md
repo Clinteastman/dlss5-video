@@ -73,5 +73,6 @@ would delay the only genuinely new part of this project.
 5. Optical-flow visualisation.
 6. NGX transport without Neural Rendering.
 7. Neural Rendering at native size.
-8. Neural Rendering plus upscaling.
-9. VSR coexistence and pass-order tests.
+8. Persistent multi-frame Neural Rendering session.
+9. Neural Rendering plus upscaling.
+10. VSR coexistence and pass-order tests.

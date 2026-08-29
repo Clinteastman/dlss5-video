@@ -87,6 +87,18 @@ Once that succeeds, process one decoded frame from a normal, unprotected video:
   -Output 'C:\path\to\processed-frame.png'
 ```
 
+Process a short clip while keeping one NGX/ReShade session alive across every
+frame (currently an offline proof, not real-time playback):
+
+```powershell
+.\scripts\Invoke-NeuralClip.ps1 `
+  -Video 'C:\path\to\video.mp4' `
+  -Start '00:00:10' `
+  -Duration 3 `
+  -FrameRate 12 `
+  -Output 'C:\path\to\processed-clip.mp4'
+```
+
 ## Legal and safety boundaries
 
 - No NVIDIA DLLs, SDK files, model weights, or third-party binaries are stored
@@ -98,9 +110,12 @@ Once that succeeds, process one decoded frame from a normal, unprotected video:
 
 ## Status
 
-The project-local mpv launcher and RTX VSR A/B baseline are working. Both a
-synthetic D3D12 texture and a decoded 960x540 video frame have been intercepted,
-processed by hidden NGX feature 18, and read back successfully on an RTX 4090
-using the user-supplied patched 310.8.0 runtime. Depth and motion are currently
+The project-local mpv launcher and RTX VSR A/B baseline are working. Synthetic
+textures, individual decoded frames, and complete short frame sequences have
+been intercepted, processed by hidden NGX feature 18, and read back successfully
+on an RTX 4090 using the user-supplied patched 310.8.0 runtime. A sequence now
+keeps one D3D12 device, NGX feature, ReShade instance, and swapchain alive across
+all frames; only the first frame resets temporal state. Depth and motion remain
 deterministic zero guides. The next milestone is replacing those placeholders
-with estimated depth and optical flow, then processing consecutive frames.
+with estimated depth and optical flow before connecting the persistent session
+directly to mpv playback.
