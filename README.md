@@ -68,4 +68,6 @@ To inspect a user-supplied Streamline ZIP without adding its DLLs to Git:
 
 ## Status
 
-Research and architecture. No working DLSS Neural Rendering video path yet.
+The project-local mpv launcher and RTX VSR A/B baseline are working. The
+user-supplied 310.8.0 Streamline package has been inspected successfully and is
+kept outside Git. The direct DLSS Neural Rendering host is the next milestone.

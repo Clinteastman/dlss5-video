@@ -62,3 +62,14 @@ Upstream:
 Create a separate integration repository. Start with mpv rather than writing a
 player. Reuse or adapt MIT-licensed bridge code with attribution. Keep NVIDIA
 runtime files user-supplied and outside version control.
+
+## Local validation
+
+The installed mpv 0.41 build exposes `d3d11vpp` with NVIDIA scaling. A 640x360
+test frame was processed to a 1280x720 D3D11 output successfully.
+
+The supplied Streamline 2.13 package contains `sl.dlss_nr.dll` and
+`nvngx_dlssnr.dll` 310.8.0. The Neural Rendering runtime matches the separate
+RTX 4000-compatible DLL already tested in a game. Its Authenticode status is a
+hash mismatch, consistent with that file having been patched; it must therefore
+remain user-supplied and must not be redistributed by this project.
