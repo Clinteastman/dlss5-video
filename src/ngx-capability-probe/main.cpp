@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -582,7 +583,8 @@ bool RunFrameSession(
     HMODULE core,
     AllocateParameters allocateParameters,
     const std::vector<std::filesystem::path>& inputPaths,
-    const std::vector<std::filesystem::path>& outputPaths)
+    const std::vector<std::filesystem::path>& outputPaths,
+    float outputScale)
 {
     const auto createFeature = Import<CreateFeature>(core, "NVSDK_NGX_D3D12_CreateFeature");
     const auto evaluateFeature = Import<EvaluateFeature>(core, "NVSDK_NGX_D3D12_EvaluateFeature");
@@ -602,6 +604,19 @@ bool RunFrameSession(
     const RgbImage* inputImage = firstImage ? &*firstImage : nullptr;
     const UINT width = inputImage != nullptr ? inputImage->width : 640;
     const UINT height = inputImage != nullptr ? inputImage->height : 360;
+    const UINT outputWidth = inputImage != nullptr
+        ? static_cast<UINT>(std::lround(static_cast<double>(width) * outputScale))
+        : width;
+    const UINT outputHeight = inputImage != nullptr
+        ? static_cast<UINT>(std::lround(static_cast<double>(height) * outputScale))
+        : height;
+    if (outputWidth == 0 || outputHeight == 0 || outputWidth > 8192 || outputHeight > 8192)
+    {
+        std::cerr << "The scaled output dimensions are unsupported.\n";
+        return false;
+    }
+    std::cout << "DLSS dimensions: " << width << 'x' << height << " -> "
+              << outputWidth << 'x' << outputHeight << '\n';
     constexpr DXGI_FORMAT colorFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     D3D12_COMMAND_QUEUE_DESC queueDescription{};
@@ -631,8 +646,8 @@ bool RunFrameSession(
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        static_cast<int>(width),
-        static_cast<int>(height),
+        static_cast<int>(outputWidth),
+        static_cast<int>(outputHeight),
         nullptr,
         nullptr,
         instance,
@@ -646,8 +661,8 @@ bool RunFrameSession(
     ComPtr<IDXGIFactory4> swapchainFactory;
     ComPtr<IDXGISwapChain1> swapchain;
     DXGI_SWAP_CHAIN_DESC1 swapchainDescription{};
-    swapchainDescription.Width = width;
-    swapchainDescription.Height = height;
+    swapchainDescription.Width = outputWidth;
+    swapchainDescription.Height = outputHeight;
     swapchainDescription.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     swapchainDescription.SampleDesc.Count = 1;
     swapchainDescription.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -687,7 +702,7 @@ bool RunFrameSession(
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             &colorClear);
     auto output = CreateTexture(
-        device, width, height, colorFormat,
+        device, outputWidth, outputHeight, colorFormat,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     auto depth = CreateTexture(
@@ -734,8 +749,8 @@ bool RunFrameSession(
     }
     parameters->Set("Width", width);
     parameters->Set("Height", height);
-    parameters->Set("OutWidth", width);
-    parameters->Set("OutHeight", height);
+    parameters->Set("OutWidth", outputWidth);
+    parameters->Set("OutHeight", outputHeight);
     parameters->Set("PerfQualityValue", 5); // DLAA/native-size path
     parameters->Set("DLSS.Feature.Create.Flags", 107);
     parameters->Set("DLSS.Enable.Output.Subrects", 1);
@@ -810,7 +825,7 @@ bool RunFrameSession(
     if (!outputPaths.empty())
     {
         const auto resultImage = ReadHalfAsRgb(
-            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), width, height);
+            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), outputWidth, outputHeight);
         if (!resultImage || !SavePpm(outputPaths.front(), *resultImage))
         {
             std::wcerr << L"Could not save processed frame: " << outputPaths.front() << L'\n';
@@ -863,7 +878,7 @@ bool RunFrameSession(
         if (!ExecuteAndWait(device, queue.Get(), list.Get())) return false;
 
         const auto resultImage = ReadHalfAsRgb(
-            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), width, height);
+            device, queue.Get(), allocator.Get(), list.Get(), output.Get(), outputWidth, outputHeight);
         if (!resultImage || frameIndex >= outputPaths.size() ||
             !SavePpm(outputPaths[frameIndex], *resultImage))
         {
@@ -898,23 +913,42 @@ int wmain(int argc, wchar_t** argv)
     std::wcout << std::unitbuf;
     std::wcerr << std::unitbuf;
 
-    if (argc < 2 || argc > 5)
+    if (argc < 2 || argc > 6)
     {
         std::wcerr
             << L"Usage:\n"
             << L"  ngx-capability-probe.exe <runtime> [--evaluate]\n"
-            << L"  ngx-capability-probe.exe <runtime> --frame <input.ppm> <output.ppm>\n"
-            << L"  ngx-capability-probe.exe <runtime> --sequence <input-dir> <output-dir>\n";
+            << L"  ngx-capability-probe.exe <runtime> --frame <input.ppm> <output.ppm> [scale]\n"
+            << L"  ngx-capability-probe.exe <runtime> --sequence <input-dir> <output-dir> [scale]\n";
         return 2;
     }
 
     const bool evaluateSynthetic = argc == 3 && std::wstring_view(argv[2]) == L"--evaluate";
-    const bool evaluateFrame = argc == 5 && std::wstring_view(argv[2]) == L"--frame";
-    const bool evaluateSequence = argc == 5 && std::wstring_view(argv[2]) == L"--sequence";
+    const bool evaluateFrame = (argc == 5 || argc == 6) && std::wstring_view(argv[2]) == L"--frame";
+    const bool evaluateSequence = (argc == 5 || argc == 6) && std::wstring_view(argv[2]) == L"--sequence";
     if (argc != 2 && !evaluateSynthetic && !evaluateFrame && !evaluateSequence)
     {
         std::wcerr << L"Invalid arguments. Use --evaluate, --frame, or --sequence.\n";
         return 2;
+    }
+
+    float outputScale = 1.0f;
+    if (argc == 6)
+    {
+        try
+        {
+            outputScale = std::stof(argv[5]);
+        }
+        catch (const std::exception&)
+        {
+            std::wcerr << L"Scale must be a number from 1.0 through 4.0.\n";
+            return 2;
+        }
+        if (!std::isfinite(outputScale) || outputScale < 1.0f || outputScale > 4.0f)
+        {
+            std::wcerr << L"Scale must be a number from 1.0 through 4.0.\n";
+            return 2;
+        }
     }
 
     std::vector<std::filesystem::path> inputPaths;
@@ -1109,7 +1143,8 @@ int wmain(int argc, wchar_t** argv)
             core,
             allocateParameters,
             inputPaths,
-            outputPaths);
+            outputPaths,
+            outputScale);
         std::cout << (evaluateSequence ? "Input sequence: " :
                       (evaluateFrame ? "Input frame: " : "Synthetic frame: "))
                   << (evaluated ? "completed" : "failed") << '\n';

@@ -96,8 +96,13 @@ frame (currently an offline proof, not real-time playback):
   -Start '00:00:10' `
   -Duration 3 `
   -FrameRate 12 `
+  -Scale 2 `
   -Output 'C:\path\to\processed-clip.mp4'
 ```
+
+`-Scale 1` keeps the source dimensions and uses the native-size/DLAA path.
+Values above 1 request a larger DLSS Super Resolution output; for example,
+960x540 with `-Scale 2` produces 1920x1080 frames.
 
 ## Legal and safety boundaries
 
@@ -116,6 +121,7 @@ been intercepted, processed by hidden NGX feature 18, and read back successfully
 on an RTX 4090 using the user-supplied patched 310.8.0 runtime. A sequence now
 keeps one D3D12 device, NGX feature, ReShade instance, and swapchain alive across
 all frames; only the first frame resets temporal state. Depth and motion remain
-deterministic zero guides. The next milestone is replacing those placeholders
-with estimated depth and optical flow before connecting the persistent session
-directly to mpv playback.
+deterministic zero guides. The processor can now request a larger DLSS output
+for combined Neural Rendering and Super Resolution. The next milestone is
+replacing the placeholder guides with estimated depth and optical flow before
+connecting the persistent session directly to mpv playback.

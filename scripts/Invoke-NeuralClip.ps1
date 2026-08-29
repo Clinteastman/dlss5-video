@@ -13,6 +13,8 @@ param(
     [int]$FrameRate = 12,
     [ValidateRange(320, 1920)]
     [int]$Width = 960,
+    [ValidateRange(1.0, 4.0)]
+    [double]$Scale = 1.0,
     [string]$RuntimeDirectory
 )
 
@@ -60,7 +62,8 @@ try {
 
     Push-Location $runtimePath
     try {
-        & $probe $runtimePath --sequence $inputFrames $outputFrames
+        $scaleText = $Scale.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        & $probe $runtimePath --sequence $inputFrames $outputFrames $scaleText
         if ($LASTEXITCODE -ne 0) {
             throw "The persistent native probe exited with code $LASTEXITCODE."
         }
