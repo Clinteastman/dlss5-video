@@ -57,6 +57,27 @@ To inspect a user-supplied Streamline ZIP without adding its DLLs to Git:
 .\scripts\Inspect-StreamlinePackage.ps1 'C:\path\to\streamline.zip'
 ```
 
+The native capability probe can be built with Visual Studio and pointed at an
+extracted, user-supplied Streamline runtime directory:
+
+```powershell
+cmake -S . -B build -A x64
+cmake --build build --config Release
+.\build\Release\ngx-capability-probe.exe 'C:\path\to\streamline'
+```
+
+For the private Neural Rendering test, prepare a Git-ignored harness from a
+user-supplied Streamline ZIP, ReShade DLL, and Neural Rendering add-on:
+
+```powershell
+.\scripts\Prepare-PrivateHarness.ps1 `
+  -StreamlineZip 'C:\path\to\streamline.zip' `
+  -ReShadeDll 'C:\path\to\dxgi.dll' `
+  -NeuralAddon 'C:\path\to\renodx-dlss5.addon64'
+
+.\scripts\Invoke-NeuralProbe.ps1
+```
+
 ## Legal and safety boundaries
 
 - No NVIDIA DLLs, SDK files, model weights, or third-party binaries are stored
@@ -68,6 +89,8 @@ To inspect a user-supplied Streamline ZIP without adding its DLLs to Git:
 
 ## Status
 
-The project-local mpv launcher and RTX VSR A/B baseline are working. The
-user-supplied 310.8.0 Streamline package has been inspected successfully and is
-kept outside Git. The direct DLSS Neural Rendering host is the next milestone.
+The project-local mpv launcher and RTX VSR A/B baseline are working. A synthetic
+D3D12 DLAA frame has also been intercepted by ReShade and processed successfully
+by hidden NGX feature 18 on an RTX 4090 using the user-supplied 310.8.0 runtime.
+The next milestone is replacing the synthetic colour/depth/motion textures with
+live video, estimated depth, and optical flow.

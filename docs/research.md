@@ -73,3 +73,10 @@ The supplied Streamline 2.13 package contains `sl.dlss_nr.dll` and
 RTX 4000-compatible DLL already tested in a game. Its Authenticode status is a
 hash mismatch, consistent with that file having been patched; it must therefore
 remain user-supplied and must not be redistributed by this project.
+
+The supplied ReShade add-on identifies Neural Rendering as NGX feature 18. In a
+private synthetic D3D12 test it hooked a normal DLAA evaluation, initialized the
+310.8.0 Neural Rendering runtime, created feature 18 at 640x360, and completed
+the first evaluation successfully on an RTX 4090. The driver capability table
+still reports `SuperSamplingDenoising.Available = 0`; the add-on's direct feature
+path is therefore essential on this GPU.

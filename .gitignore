@@ -11,9 +11,12 @@ captures/
 # Proprietary or user-supplied runtime files
 nvngx_*.dll
 sl.*.dll
+dxgi.dll
+*.addon64
 *.onnx
 *.engine
 models/
+private-runtime/
 
 # ReShade runtime state
 ReShade.ini
