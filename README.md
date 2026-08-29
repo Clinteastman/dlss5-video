@@ -104,6 +104,56 @@ frame (currently an offline proof, not real-time playback):
 Values above 1 request a larger DLSS Super Resolution output; for example,
 960x540 with `-Scale 2` produces 1920x1080 frames.
 
+## Experimental live mpv renderer
+
+The repository now contains a ReShade add-on that processes mpv's live D3D11
+backbuffer through a persistent D3D12 NGX session. It keeps presenting while a
+source frame is frozen, so the ReShade overlay remains interactive and Neural
+Rendering controls can be compared on exactly the same image.
+
+Build it against a local ReShade source checkout:
+
+```powershell
+cmake -S . -B build -A x64 `
+  -DRESHADE_SOURCE_DIR='C:\path\to\reshade'
+cmake --build build --config Release --target dlss5-video-renderer
+```
+
+The resulting `dlss5-video-renderer.addon64` must be loaded by a separately
+prepared, Git-ignored ReShade/mpv test harness. No ReShade, NVIDIA, RenoDX, or
+patched runtime binaries are redistributed here.
+
+The add-on currently provides:
+
+- live Neural Rendering output or an original/bypass view;
+- an interactive frozen-frame comparison without stopping presentation;
+- independent estimated-depth and optical-flow controls;
+- depth-direction and blank-guide A/B diagnostics;
+- depth and motion-vector preview views; and
+- explicit NGX evaluation, guide-frame, and GPU-resource binding status.
+
+Precompute guides from decoded image frames, then pack them into the stream read
+by the live add-on:
+
+```powershell
+python .\scripts\Estimate-VideoGuides.py `
+  --input-dir C:\path\to\frames `
+  --depth-dir C:\path\to\depth `
+  --motion-dir C:\path\to\motion `
+  --model-cache C:\path\to\model-cache
+
+python .\scripts\Pack-VideoGuides.py `
+  --depth-dir C:\path\to\depth `
+  --motion-dir C:\path\to\motion `
+  --output C:\path\to\guides.d5gp
+
+$env:DLSS5_VIDEO_GUIDE_PACK = 'C:\path\to\guides.d5gp'
+```
+
+`Estimate-VideoGuides.py` currently uses Depth Anything V2 Small and OpenCV DIS
+optical flow. Model files are downloaded to the caller-supplied cache and must
+not be committed.
+
 ## Legal and safety boundaries
 
 - No NVIDIA DLLs, SDK files, model weights, or third-party binaries are stored
@@ -115,13 +165,23 @@ Values above 1 request a larger DLSS Super Resolution output; for example,
 
 ## Status
 
-The project-local mpv launcher and RTX VSR A/B baseline are working. Synthetic
-textures, individual decoded frames, and complete short frame sequences have
-been intercepted, processed by hidden NGX feature 18, and read back successfully
-on an RTX 4090 using the user-supplied patched 310.8.0 runtime. A sequence now
-keeps one D3D12 device, NGX feature, ReShade instance, and swapchain alive across
-all frames; only the first frame resets temporal state. Depth and motion remain
-deterministic zero guides. The processor can now request a larger DLSS output
-for combined Neural Rendering and Super Resolution. The next milestone is
-replacing the placeholder guides with estimated depth and optical flow before
-connecting the persistent session directly to mpv playback.
+The project-local mpv launcher and RTX VSR A/B baseline work. Synthetic textures,
+decoded frames, offline clips, and live mpv frames have been processed by hidden
+NGX feature 18 and read back successfully on an RTX 4090 with a user-supplied
+patched 310.8.0 runtime. The live path keeps one D3D12 device and NGX feature
+active, synchronises its D3D11/D3D12 copies, and continuously evaluates at the
+source frame rate. Precomputed estimated depth and optical flow are uploaded as
+real GPU guide textures; switching between estimated and blank textures changes
+the Neural Rendering result, confirming that the guides are consumed.
+
+This is still an experimental checkpoint, not a finished video filter. The
+current output can show grey or shadowed faces and an under-converged, textured
+or rippling appearance. Frozen-frame motion is now suppressed, which removes a
+large repeated-warp instability, but the remaining quality does not yet match
+the reference OBS prototype. The same user-supplied runtime gives clean results
+in games on the test machine, which points to our guide and colour inputs rather
+than the runtime itself. The largest known differences are the reference's
+NVIDIA Optical Flow path with temporal hints, our independently normalised
+monocular depth, colour/exposure handling, and source material. The next
+milestone is controlled colour-contract testing followed by NVIDIA Optical Flow
+and temporally stable video depth.
