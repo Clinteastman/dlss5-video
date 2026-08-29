@@ -6,12 +6,17 @@
 mpv / D3D11 presentation
           |
           v
-    frame acquisition
-      |           |
-      v           v
- depth model   optical flow
-      |           |
-      +-----+-----+
+ frame acquisition + 10-bit conversion
+            |
+            v
+ shared-memory latest-frame slot
+      |                         |
+      v                         v
+ Depth Anything V2       NVIDIA Optical Flow
+      |                         |
+      +------------+------------+
+                   v
+       shared-memory guide slot
             v
  D3D11 -> shared D3D12 resources
             |
@@ -41,19 +46,25 @@ would delay the only genuinely new part of this project.
 
 ### Frame acquisition and presentation
 
-- ReShade add-on or a small mpv/libplacebo integration, chosen after the baseline
-  confirms which surface contains the video before UI composition.
+- The ReShade add-on captures mpv's clean D3D11 backbuffer before UI composition.
+- A single-slot asynchronous bridge drops stale capture opportunities rather
+  than blocking playback behind depth inference.
+- R8G8B8A8 and R10G10B10A2 mpv surfaces are converted to RGB8 for the companion.
 - Bypass path must remain available if any experimental stage fails.
 
 ### Depth
 
-- Begin with Depth Anything V2 Small through ONNX Runtime / DirectML or TensorRT.
-- Run below source resolution initially and resize on the GPU.
-- Add temporal smoothing because single-frame depth will otherwise flicker.
+- Depth Anything V2 Small currently runs through PyTorch CUDA in a companion
+  process, at 392x392 by default, then returns a 960x540 guide.
+- Motion-compensated temporal smoothing and stable percentile ranges reduce
+  frame-to-frame depth flicker.
+- TensorRT and direct GPU texture sharing remain performance upgrades.
 
 ### Motion
 
 - Prefer NVIDIA Optical Flow for low-latency dense motion vectors.
+- The live path uses the Fast preset, half guide resolution, a 1x1 output grid,
+  and temporal hints.
 - Detect scene cuts and reset temporal state.
 - Provide a debug view for vector direction and scale.
 

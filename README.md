@@ -130,9 +130,25 @@ The add-on currently provides:
 - independent estimated-depth and optical-flow controls;
 - depth-direction and blank-guide A/B diagnostics;
 - depth and motion-vector preview views;
-- live window-resize rebuilding, with fixed-resolution guides as the NGX input
-  and a larger window as the genuine NGX output; and
+- real-time Depth Anything and NVIDIA Optical Flow guides delivered by a
+  non-blocking companion process;
+- direct local-file and YouTube URL playback through the live launcher;
+- live window-resize rebuilding, with the guide resolution as the NGX input and
+  a larger window as the genuine NGX output; and
 - explicit NGX evaluation, guide-frame, and GPU-resource binding status.
+
+Start the real-time path after preparing the private harness and Python CUDA
+dependencies:
+
+```powershell
+.\scripts\Start-LiveVideo.ps1 'C:\path\to\video.mp4'
+.\scripts\Start-LiveVideo.ps1 'https://www.youtube.com/watch?v=VIDEO_ID'
+```
+
+The default pipeline produces 960x540 guides, runs the depth model internally at
+392x392, runs NVIDIA Optical Flow at 480x270, and asks NGX for a 1920x1080
+output. `-InputWidth`, `-InputHeight`, `-DepthSize`, `-WindowWidth`, and
+`-WindowHeight` expose those trade-offs. Use `-Loop` for short test clips.
 
 Precompute guides from decoded image frames, then pack them into the stream read
 by the live add-on:
@@ -173,12 +189,13 @@ decoded frames, offline clips, and live mpv frames have been processed by hidden
 NGX feature 18 and read back successfully on an RTX 4090 with a user-supplied
 patched 310.8.0 runtime. The live path keeps one D3D12 device and NGX feature
 active, synchronises its D3D11/D3D12 copies, and continuously evaluates at the
-source frame rate. Resizing above the fixed guide resolution rebuilds the NGX
-feature with separate input and output sizes, so NGX generates the larger image
-instead of the player stretching a native-size result. Precomputed estimated
-depth and optical flow are uploaded as real GPU guide textures; switching
-between estimated and blank textures changes the Neural Rendering result,
-confirming that the guides are consumed.
+source frame rate. A shared-memory companion now calculates depth and NVIDIA
+Optical Flow from the frames being presented, so arbitrary local files and
+YouTube videos no longer depend on a precomputed guide pack. On the RTX 4090
+test machine, the default 392x392 depth inference normally completes in about
+31-40 ms while mpv continues presenting. Resizing above the guide resolution
+rebuilds the NGX feature with separate input and output sizes, so NGX generates
+the larger image instead of the player stretching a native-size result.
 
 This is still an experimental checkpoint, not a finished video filter. The
 current output can show grey or shadowed faces and an under-converged, textured
@@ -189,5 +206,6 @@ in games on the test machine, which points to our guide and colour inputs rather
 than the runtime itself. The guide path now matches the reference's NVIDIA
 Optical Flow fast/half-resolution/temporal-hint configuration. The largest
 remaining differences are temporally stable video depth, colour/exposure
-handling, and source material. The next milestone is controlled colour-contract
-testing followed by improved temporally stable video depth.
+handling, guide-to-video latency when inference exceeds one presentation
+interval, and source material. The next milestone is GPU-shared frame transport
+and delayed-frame alignment, followed by controlled colour-contract testing.

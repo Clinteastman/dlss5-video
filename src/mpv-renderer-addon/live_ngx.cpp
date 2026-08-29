@@ -36,9 +36,27 @@ struct GuidePackHeader
     uint32_t fpsDenominator;
     uint64_t frameStride;
 };
+
+struct LiveGuideHeader
+{
+    char magic[4];
+    uint32_t version;
+    uint32_t width;
+    uint32_t height;
+    uint32_t frameBytes;
+    uint32_t guideBytes;
+    volatile LONG inputState;
+    volatile LONG outputState;
+    volatile LONG64 inputSequence;
+    volatile LONG64 outputSequence;
+    uint32_t reset;
+    uint32_t processingMicroseconds;
+    uint64_t generatedCount;
+};
 #pragma pack(pop)
 
 static_assert(sizeof(GuidePackHeader) == 36);
+static_assert(sizeof(LiveGuideHeader) == 64);
 
 struct NgxParameter
 {
@@ -131,6 +149,8 @@ struct Session
     bool ngxInitialized = false;
     bool attempted = false;
     bool ready = false;
+    bool liveGuides = false;
+    bool liveGuideReady = false;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t outputWidth = 0;
@@ -141,6 +161,12 @@ struct Session
     HANDLE guideMapping = nullptr;
     const uint8_t* guideData = nullptr;
     uint64_t guideSize = 0;
+    HANDLE liveMapping = nullptr;
+    uint8_t* liveData = nullptr;
+    uint64_t liveSize = 0;
+    uint64_t publishedSequence = 0;
+    uint64_t consumedSequence = 0;
+    uint64_t droppedFrames = 0;
     GuidePackHeader guideHeader{};
     uint32_t currentGuideFrame = std::numeric_limits<uint32_t>::max();
     bool holdingGuide = false;
@@ -176,7 +202,10 @@ struct Session
     ComPtr<ID3D11Texture2D> color11;
     ComPtr<ID3D11Texture2D> output11;
     ComPtr<ID3D11Texture2D> guidePreview11;
+    ComPtr<ID3D11Texture2D> liveReadback11;
     std::vector<uint32_t> guidePreview;
+    std::vector<float> liveDepth;
+    std::vector<uint16_t> liveMotion;
     ComPtr<ID3D11DeviceContext> context11;
     ComPtr<ID3D11VideoDevice> videoDevice;
     ComPtr<ID3D11VideoContext> videoContext;
@@ -435,7 +464,9 @@ void reset_transport()
     session.depthUploadData = nullptr;
     session.motionUploadData = nullptr;
     if (session.guideData != nullptr) UnmapViewOfFile(session.guideData);
+    if (session.liveData != nullptr) UnmapViewOfFile(session.liveData);
     if (session.guideMapping != nullptr) CloseHandle(session.guideMapping);
+    if (session.liveMapping != nullptr) CloseHandle(session.liveMapping);
     if (session.guideFile != INVALID_HANDLE_VALUE) CloseHandle(session.guideFile);
     if (session.colorShared != nullptr) CloseHandle(session.colorShared);
     if (session.outputShared != nullptr) CloseHandle(session.outputShared);
@@ -458,6 +489,7 @@ void reset_transport()
     session.videoContext.Reset();
     session.videoDevice.Reset();
     session.guidePreview11.Reset();
+    session.liveReadback11.Reset();
     session.output11.Reset();
     session.color11.Reset();
     session.context11.Reset();
@@ -499,8 +531,73 @@ std::filesystem::path addon_directory(HMODULE module)
     return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
 }
 
+bool environment_enabled(const wchar_t* name)
+{
+    std::array<wchar_t, 16> value{};
+    const DWORD length = GetEnvironmentVariableW(
+        name, value.data(), static_cast<DWORD>(value.size()));
+    return length != 0 && length < value.size() && value[0] != L'0';
+}
+
+uint32_t environment_dimension(const wchar_t* name, uint32_t fallback)
+{
+    std::array<wchar_t, 32> value{};
+    const DWORD length = GetEnvironmentVariableW(
+        name, value.data(), static_cast<DWORD>(value.size()));
+    if (length == 0 || length >= value.size()) return fallback;
+    const unsigned long parsed = wcstoul(value.data(), nullptr, 10);
+    return parsed >= 64 && parsed <= 4096
+        ? static_cast<uint32_t>(parsed) : fallback;
+}
+
+bool open_live_guides(uint32_t width, uint32_t height)
+{
+    const uint64_t pixels = static_cast<uint64_t>(width) * height;
+    const uint64_t frameBytes = pixels * 4;
+    const uint64_t guideBytes = pixels * 8;
+    session.liveSize = sizeof(LiveGuideHeader) + frameBytes + guideBytes;
+    if (session.liveSize > std::numeric_limits<DWORD>::max()) return false;
+    session.liveMapping = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+        static_cast<DWORD>(session.liveSize), L"Local\\DLSS5VideoLiveGuides");
+    if (session.liveMapping == nullptr) return false;
+    session.liveData = static_cast<uint8_t*>(MapViewOfFile(
+        session.liveMapping, FILE_MAP_ALL_ACCESS, 0, 0, session.liveSize));
+    if (session.liveData == nullptr) return false;
+
+    auto* const header = reinterpret_cast<LiveGuideHeader*>(session.liveData);
+    if (std::memcmp(header->magic, "D5LV", 4) != 0 ||
+        header->version != 1 || header->width != width ||
+        header->height != height || header->frameBytes != frameBytes ||
+        header->guideBytes != guideBytes)
+    {
+        std::memset(session.liveData, 0, static_cast<size_t>(session.liveSize));
+        std::memcpy(header->magic, "D5LV", 4);
+        header->version = 1;
+        header->width = width;
+        header->height = height;
+        header->frameBytes = static_cast<uint32_t>(frameBytes);
+        header->guideBytes = static_cast<uint32_t>(guideBytes);
+    }
+    session.liveDepth.resize(static_cast<size_t>(pixels));
+    session.liveMotion.resize(static_cast<size_t>(pixels) * 2);
+    session.guideHeader.width = width;
+    session.guideHeader.height = height;
+    session.guideState = "waiting for the real-time depth and optical-flow service";
+    return true;
+}
+
 bool load_guide_pack(HMODULE module)
 {
+    if (environment_enabled(L"DLSS5_VIDEO_LIVE_GUIDES"))
+    {
+        session.liveGuides = true;
+        const uint32_t width = environment_dimension(
+            L"DLSS5_VIDEO_INPUT_WIDTH", 960);
+        const uint32_t height = environment_dimension(
+            L"DLSS5_VIDEO_INPUT_HEIGHT", 540);
+        return open_live_guides(width, height);
+    }
     std::array<wchar_t, 32768> configured{};
     const DWORD configuredLength = GetEnvironmentVariableW(
         L"DLSS5_VIDEO_GUIDE_PACK", configured.data(),
@@ -662,6 +759,162 @@ bool upload_guide_frame(uint32_t frameIndex, bool reverseDepth, bool& reset)
     return true;
 }
 
+bool publish_live_frame()
+{
+    if (!session.liveGuides || session.liveData == nullptr ||
+        session.liveReadback11 == nullptr) return true;
+    if (session.sharedFormat != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        session.sharedFormat != DXGI_FORMAT_R10G10B10A2_UNORM)
+    {
+        session.guideState = "live guides currently require an 8-bit SDR mpv surface";
+        return true;
+    }
+
+    auto* const header = reinterpret_cast<LiveGuideHeader*>(session.liveData);
+    if (InterlockedCompareExchange(&header->inputState, 1, 0) != 0)
+    {
+        ++session.droppedFrames;
+        return true;
+    }
+
+    session.context11->CopyResource(
+        session.liveReadback11.Get(), session.color11.Get());
+    if (!wait_for_d3d11_copy())
+    {
+        InterlockedExchange(&header->inputState, 0);
+        return false;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(session.context11->Map(
+            session.liveReadback11.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+    {
+        InterlockedExchange(&header->inputState, 0);
+        return false;
+    }
+    uint8_t* const target = session.liveData + sizeof(LiveGuideHeader);
+    const uint32_t rowBytes = session.width * 4;
+    for (uint32_t y = 0; y < session.height; ++y)
+    {
+        uint8_t* const targetRow = target + static_cast<size_t>(y) * rowBytes;
+        const uint8_t* const sourceRow =
+            static_cast<const uint8_t*>(mapped.pData) +
+            static_cast<size_t>(y) * mapped.RowPitch;
+        if (session.sharedFormat == DXGI_FORMAT_R8G8B8A8_UNORM)
+            std::memcpy(targetRow, sourceRow, rowBytes);
+        else
+        {
+            const auto* const packed = reinterpret_cast<const uint32_t*>(sourceRow);
+            for (uint32_t x = 0; x < session.width; ++x)
+            {
+                const uint32_t value = packed[x];
+                targetRow[x * 4 + 0] = static_cast<uint8_t>(
+                    ((value & 0x3FFu) * 255u + 511u) / 1023u);
+                targetRow[x * 4 + 1] = static_cast<uint8_t>(
+                    (((value >> 10) & 0x3FFu) * 255u + 511u) / 1023u);
+                targetRow[x * 4 + 2] = static_cast<uint8_t>(
+                    (((value >> 20) & 0x3FFu) * 255u + 511u) / 1023u);
+                targetRow[x * 4 + 3] = 255;
+            }
+        }
+    }
+    session.context11->Unmap(session.liveReadback11.Get(), 0);
+    const LONG64 sequence = static_cast<LONG64>(++session.publishedSequence);
+    InterlockedExchange64(&header->inputSequence, sequence);
+    MemoryBarrier();
+    InterlockedExchange(&header->inputState, 2);
+    return true;
+}
+
+bool upload_live_guides(bool reverseDepth, bool& reset, bool& updated)
+{
+    updated = false;
+    reset = false;
+    if (!session.liveGuides || session.liveData == nullptr) return true;
+    auto* const header = reinterpret_cast<LiveGuideHeader*>(session.liveData);
+    if (InterlockedCompareExchange(&header->outputState, 3, 2) != 2)
+        return true;
+
+    const uint64_t sequence = static_cast<uint64_t>(header->outputSequence);
+    if (sequence <= session.consumedSequence)
+    {
+        InterlockedExchange(&header->outputState, 0);
+        return true;
+    }
+    const uint64_t pixels = static_cast<uint64_t>(session.width) * session.height;
+    const uint8_t* const guide = session.liveData + sizeof(LiveGuideHeader) +
+        header->frameBytes;
+    std::memcpy(
+        session.liveDepth.data(), guide,
+        static_cast<size_t>(pixels * sizeof(float)));
+    std::memcpy(
+        session.liveMotion.data(), guide + pixels * sizeof(float),
+        static_cast<size_t>(pixels * sizeof(uint16_t) * 2));
+    reset = header->reset != 0 ||
+        (session.consumedSequence != 0 &&
+         sequence > session.consumedSequence + 2);
+    session.consumedSequence = sequence;
+    const bool firstLiveGuide = !session.liveGuideReady;
+    session.liveGuideReady = true;
+    session.guideState = "real-time guides active; generated " +
+        std::to_string(header->generatedCount) + ", latest " +
+        std::to_string(header->processingMicroseconds / 1000) + " ms, dropped " +
+        std::to_string(session.droppedFrames) + " capture frames";
+    InterlockedExchange(&header->outputState, 0);
+    if (firstLiveGuide)
+        reshade::log::message(
+            reshade::log::level::info,
+            "DLSS 5 Video Renderer consumed its first real-time guide frame.");
+
+    const uint32_t tightPitch = session.width * sizeof(float);
+    for (uint32_t y = 0; y < session.height; ++y)
+    {
+        auto* const targetDepth = reinterpret_cast<float*>(
+            session.depthUploadData +
+            static_cast<size_t>(y) * session.depthFootprint.Footprint.RowPitch);
+        const float* const sourceDepth = session.liveDepth.data() +
+            static_cast<size_t>(y) * session.width;
+        if (!reverseDepth)
+            std::memcpy(targetDepth, sourceDepth, tightPitch);
+        else
+            for (uint32_t x = 0; x < session.width; ++x)
+                targetDepth[x] = 1.0f - sourceDepth[x];
+        std::memcpy(
+            session.motionUploadData +
+                static_cast<size_t>(y) * session.motionFootprint.Footprint.RowPitch,
+            session.liveMotion.data() +
+                static_cast<size_t>(y) * session.width * 2,
+            tightPitch);
+    }
+
+    barrier(session.depth.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    barrier(session.motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION depthSource{};
+    depthSource.pResource = session.depthUpload.Get();
+    depthSource.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    depthSource.PlacedFootprint = session.depthFootprint;
+    D3D12_TEXTURE_COPY_LOCATION depthTarget{};
+    depthTarget.pResource = session.depth.Get();
+    depthTarget.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION motionSource{};
+    motionSource.pResource = session.motionUpload.Get();
+    motionSource.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    motionSource.PlacedFootprint = session.motionFootprint;
+    D3D12_TEXTURE_COPY_LOCATION motionTarget{};
+    motionTarget.pResource = session.motion.Get();
+    motionTarget.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    session.list->CopyTextureRegion(&depthTarget, 0, 0, 0, &depthSource, nullptr);
+    session.list->CopyTextureRegion(&motionTarget, 0, 0, 0, &motionSource, nullptr);
+    barrier(session.depth.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(session.motion.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    session.uploadedReverseEstimatedDepth = reverseDepth;
+    updated = true;
+    return true;
+}
+
 uint32_t pack_preview_pixel(float red, float green, float blue)
 {
     red = std::clamp(red, 0.0f, 1.0f);
@@ -682,15 +935,22 @@ uint32_t pack_preview_pixel(float red, float green, float blue)
 
 bool show_guide_preview(ID3D11Texture2D* backBuffer, int debugView)
 {
-    if (session.guideData == nullptr || session.guidePreview11 == nullptr ||
-        session.currentGuideFrame == std::numeric_limits<uint32_t>::max() ||
+    if ((!session.liveGuideReady && session.guideData == nullptr) ||
+        session.guidePreview11 == nullptr ||
         (debugView != 2 && debugView != 3)) return false;
 
-    const uint8_t* const frame = guide_frame_data(session.currentGuideFrame);
-    const auto* const depth = reinterpret_cast<const float*>(frame + sizeof(uint32_t));
-    const auto* const motion = reinterpret_cast<const uint16_t*>(
-        frame + sizeof(uint32_t) +
-        static_cast<uint64_t>(session.width) * session.height * sizeof(float));
+    const float* depth = session.liveGuides ? session.liveDepth.data() : nullptr;
+    const uint16_t* motion = session.liveGuides ? session.liveMotion.data() : nullptr;
+    if (!session.liveGuides)
+    {
+        if (session.currentGuideFrame == std::numeric_limits<uint32_t>::max())
+            return false;
+        const uint8_t* const frame = guide_frame_data(session.currentGuideFrame);
+        depth = reinterpret_cast<const float*>(frame + sizeof(uint32_t));
+        motion = reinterpret_cast<const uint16_t*>(
+            frame + sizeof(uint32_t) +
+            static_cast<uint64_t>(session.width) * session.height * sizeof(float));
+    }
     const size_t pixels = static_cast<size_t>(session.width) * session.height;
     for (size_t index = 0; index < pixels; ++index)
     {
@@ -787,9 +1047,9 @@ bool initialize(
         log_error("DLSS 5 Video Renderer could not load its guide pack.");
         return false;
     }
-    const uint32_t width = session.guideData != nullptr
+    const uint32_t width = (session.guideData != nullptr || session.liveGuides)
         ? session.guideHeader.width : backBufferWidth;
-    const uint32_t height = session.guideData != nullptr
+    const uint32_t height = (session.guideData != nullptr || session.liveGuides)
         ? session.guideHeader.height : backBufferHeight;
     session.width = width;
     session.height = height;
@@ -921,7 +1181,7 @@ bool initialize(
         log_error("DLSS 5 Video Renderer could not create NGX textures.");
         return false;
     }
-    if (session.guideData != nullptr)
+    if (session.guideData != nullptr || session.liveGuides)
     {
         const D3D12_RESOURCE_DESC depthDesc = session.depth->GetDesc();
         const D3D12_RESOURCE_DESC motionDesc = session.motion->GetDesc();
@@ -958,6 +1218,25 @@ bool initialize(
             return false;
         }
         session.guidePreview.resize(static_cast<size_t>(width) * height);
+
+        if (session.liveGuides)
+        {
+            D3D11_TEXTURE2D_DESC readbackDesc{};
+            readbackDesc.Width = width;
+            readbackDesc.Height = height;
+            readbackDesc.MipLevels = 1;
+            readbackDesc.ArraySize = 1;
+            readbackDesc.Format = backBufferFormat;
+            readbackDesc.SampleDesc.Count = 1;
+            readbackDesc.Usage = D3D11_USAGE_STAGING;
+            readbackDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(hostDevice->CreateTexture2D(
+                    &readbackDesc, nullptr, &session.liveReadback11)))
+            {
+                log_error("DLSS 5 Video Renderer could not create its live-frame readback.");
+                return false;
+            }
+        }
     }
 
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
@@ -1096,10 +1375,16 @@ bool evaluate_transport(
         session.ready = false;
         return false;
     }
+    if (!publish_live_frame())
+    {
+        log_error("DLSS 5 Video Renderer could not publish a frame for live guides.");
+        return false;
+    }
 
     if (FAILED(session.allocator->Reset()) ||
         FAILED(session.list->Reset(session.allocator.Get(), nullptr))) return false;
     bool guideReset = false;
+    bool liveGuideUpdated = false;
     const bool holdModeChanged = holdGuide != session.holdingGuide;
     if (session.guideData != nullptr)
     {
@@ -1116,16 +1401,26 @@ bool evaluate_transport(
             return false;
         }
     }
+    else if (session.liveGuides &&
+             !upload_live_guides(
+                 reverseEstimatedDepth, guideReset, liveGuideUpdated))
+    {
+        log_error("DLSS 5 Video Renderer could not upload its live guides.");
+        return false;
+    }
     session.holdingGuide = holdGuide;
     barrier(session.color.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(session.output.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    const bool guidesAvailable = session.guideData != nullptr ||
+        session.liveGuideReady;
     ID3D12Resource* const selectedDepth =
-        useEstimatedDepth && session.guideData != nullptr
+        useEstimatedDepth && guidesAvailable
             ? session.depth.Get() : session.zeroDepth.Get();
     ID3D12Resource* const selectedMotion =
-        useEstimatedMotion && session.guideData != nullptr && !holdGuide
+        useEstimatedMotion && guidesAvailable && !holdGuide &&
+            (!session.liveGuides || liveGuideUpdated)
             ? session.motion.Get() : session.zeroMotion.Get();
     session.parameters->Set("Depth", selectedDepth);
     session.parameters->Set("MotionVectors", selectedMotion);
@@ -1141,9 +1436,10 @@ bool evaluate_transport(
     if (depthMatches && motionMatches)
     {
         const bool estimatedDepth =
-            useEstimatedDepth && session.guideData != nullptr;
+            useEstimatedDepth && guidesAvailable;
         const bool estimatedMotion =
-            useEstimatedMotion && session.guideData != nullptr && !holdGuide;
+            useEstimatedMotion && guidesAvailable && !holdGuide &&
+            (!session.liveGuides || liveGuideUpdated);
         session.guideBindingState =
             std::string(estimatedDepth
                 ? (reverseEstimatedDepth ? "reversed estimated depth" : "estimated depth")
@@ -1192,7 +1488,7 @@ bool evaluate_transport(
             return false;
         }
     }
-    else if (session.guideData != nullptr &&
+    else if ((session.guideData != nullptr || session.liveGuideReady) &&
              (debugView == 2 || debugView == 3) &&
              !show_guide_preview(backBuffer, debugView))
     {
@@ -1208,10 +1504,22 @@ bool evaluate_transport(
 uint64_t evaluation_count() { return session.evaluations; }
 uint32_t guide_frame_index()
 {
+    if (session.liveGuides)
+        return guide_frame_count();
     return session.currentGuideFrame == std::numeric_limits<uint32_t>::max()
         ? 0 : session.currentGuideFrame + 1;
 }
-uint32_t guide_frame_count() { return session.guideHeader.frameCount; }
+uint32_t guide_frame_count()
+{
+    if (session.liveGuides && session.liveData != nullptr)
+    {
+        const auto* const header =
+            reinterpret_cast<const LiveGuideHeader*>(session.liveData);
+        return static_cast<uint32_t>(std::min<uint64_t>(
+            header->generatedCount, std::numeric_limits<uint32_t>::max()));
+    }
+    return session.guideHeader.frameCount;
+}
 const char* guide_status() { return session.guideState.c_str(); }
 const char* guide_binding_status() { return session.guideBindingState.c_str(); }
 const char* status() { return session.state.c_str(); }
