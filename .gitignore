@@ -3,6 +3,8 @@ build/
 out/
 .vs/
 CMakeUserPresets.json
+__pycache__/
+*.pyc
 
 # Runtime logs and captures
 *.log

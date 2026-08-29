@@ -66,6 +66,8 @@ using InitExt = NgxResult (*)(unsigned long long, const wchar_t*, ID3D12Device*,
 using AllocateParameters = NgxResult (*)(NgxParameter**);
 using CreateFeature = NgxResult (*)(ID3D12GraphicsCommandList*, int, NgxParameter*, NgxHandle**);
 using EvaluateFeature = NgxResult (*)(ID3D12GraphicsCommandList*, const NgxHandle*, const NgxParameter*, void*);
+using ReleaseFeature = NgxResult (*)(NgxHandle*);
+using DestroyParameters = NgxResult (*)(NgxParameter*);
 
 template <typename T>
 T import(HMODULE module, const char* name)
@@ -111,13 +113,28 @@ NgxResult safe_evaluate(
     }
 }
 
+NgxResult safe_release(ReleaseFeature function, NgxHandle* handle)
+{
+    __try { return function(handle); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+NgxResult safe_destroy_parameters(DestroyParameters function, NgxParameter* parameters)
+{
+    __try { return function(parameters); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 struct Session
 {
     bool preloaded = false;
+    bool ngxInitialized = false;
     bool attempted = false;
     bool ready = false;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t outputWidth = 0;
+    uint32_t outputHeight = 0;
     DXGI_FORMAT sharedFormat = DXGI_FORMAT_UNKNOWN;
     uint64_t evaluations = 0;
     HANDLE guideFile = INVALID_HANDLE_VALUE;
@@ -161,6 +178,12 @@ struct Session
     ComPtr<ID3D11Texture2D> guidePreview11;
     std::vector<uint32_t> guidePreview;
     ComPtr<ID3D11DeviceContext> context11;
+    ComPtr<ID3D11VideoDevice> videoDevice;
+    ComPtr<ID3D11VideoContext> videoContext;
+    ComPtr<ID3D11VideoProcessorEnumerator> inputScalerEnumerator;
+    ComPtr<ID3D11VideoProcessor> inputScaler;
+    ComPtr<ID3D11VideoProcessorEnumerator> previewScalerEnumerator;
+    ComPtr<ID3D11VideoProcessor> previewScaler;
     ComPtr<ID3D11Query> copyQuery;
     HANDLE colorShared = nullptr;
     HANDLE outputShared = nullptr;
@@ -169,6 +192,8 @@ struct Session
     NgxHandle* feature = nullptr;
     CreateFeature createFeature = nullptr;
     EvaluateFeature evaluateFeature = nullptr;
+    ReleaseFeature releaseFeature = nullptr;
+    DestroyParameters destroyParameters = nullptr;
 };
 
 Session session;
@@ -245,6 +270,7 @@ bool make_shared_texture(
     desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
         (unorderedAccess ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
     HRESULT result = session.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
@@ -278,6 +304,7 @@ bool make_shared_texture(
     desc11.SampleDesc.Count = 1;
     desc11.Usage = D3D11_USAGE_DEFAULT;
     desc11.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+        D3D11_BIND_RENDER_TARGET |
         (unorderedAccess ? D3D11_BIND_UNORDERED_ACCESS : 0);
     desc11.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
                        D3D11_RESOURCE_MISC_SHARED;
@@ -329,6 +356,142 @@ bool wait_for_d3d11_copy()
     return true;
 }
 
+bool make_video_scaler(
+    uint32_t inputWidth,
+    uint32_t inputHeight,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    ComPtr<ID3D11VideoProcessorEnumerator>& enumerator,
+    ComPtr<ID3D11VideoProcessor>& processor)
+{
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC desc{};
+    desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    desc.InputFrameRate = {30000, 1001};
+    desc.InputWidth = inputWidth;
+    desc.InputHeight = inputHeight;
+    desc.OutputFrameRate = {30000, 1001};
+    desc.OutputWidth = outputWidth;
+    desc.OutputHeight = outputHeight;
+    desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    return SUCCEEDED(session.videoDevice->CreateVideoProcessorEnumerator(
+               &desc, &enumerator)) &&
+           SUCCEEDED(session.videoDevice->CreateVideoProcessor(
+               enumerator.Get(), 0, &processor));
+}
+
+bool scale_d3d11_texture(
+    ID3D11Texture2D* source,
+    ID3D11Texture2D* destination,
+    ID3D11VideoProcessorEnumerator* enumerator,
+    ID3D11VideoProcessor* processor)
+{
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    D3D11_TEXTURE2D_DESC destinationDesc{};
+    source->GetDesc(&sourceDesc);
+    destination->GetDesc(&destinationDesc);
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDesc{};
+    inputDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    inputDesc.Texture2D.MipSlice = 0;
+    inputDesc.Texture2D.ArraySlice = 0;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDesc{};
+    outputDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    outputDesc.Texture2D.MipSlice = 0;
+    ComPtr<ID3D11VideoProcessorInputView> inputView;
+    ComPtr<ID3D11VideoProcessorOutputView> outputView;
+    if (FAILED(session.videoDevice->CreateVideoProcessorInputView(
+            source, enumerator, &inputDesc, &inputView)) ||
+        FAILED(session.videoDevice->CreateVideoProcessorOutputView(
+            destination, enumerator, &outputDesc, &outputView))) return false;
+
+    RECT sourceRect{0, 0, static_cast<LONG>(sourceDesc.Width),
+                    static_cast<LONG>(sourceDesc.Height)};
+    RECT destinationRect{0, 0, static_cast<LONG>(destinationDesc.Width),
+                         static_cast<LONG>(destinationDesc.Height)};
+    session.videoContext->VideoProcessorSetStreamSourceRect(
+        processor, 0, TRUE, &sourceRect);
+    session.videoContext->VideoProcessorSetStreamDestRect(
+        processor, 0, TRUE, &destinationRect);
+    session.videoContext->VideoProcessorSetOutputTargetRect(
+        processor, TRUE, &destinationRect);
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = inputView.Get();
+    return SUCCEEDED(session.videoContext->VideoProcessorBlt(
+        processor, outputView.Get(), 0, 1, &stream));
+}
+
+void reset_transport()
+{
+    if (session.feature != nullptr && session.releaseFeature != nullptr)
+        safe_release(session.releaseFeature, session.feature);
+    session.feature = nullptr;
+    if (session.parameters != nullptr && session.destroyParameters != nullptr)
+        safe_destroy_parameters(session.destroyParameters, session.parameters);
+    session.parameters = nullptr;
+    if (session.depthUpload != nullptr && session.depthUploadData != nullptr)
+        session.depthUpload->Unmap(0, nullptr);
+    if (session.motionUpload != nullptr && session.motionUploadData != nullptr)
+        session.motionUpload->Unmap(0, nullptr);
+    session.depthUploadData = nullptr;
+    session.motionUploadData = nullptr;
+    if (session.guideData != nullptr) UnmapViewOfFile(session.guideData);
+    if (session.guideMapping != nullptr) CloseHandle(session.guideMapping);
+    if (session.guideFile != INVALID_HANDLE_VALUE) CloseHandle(session.guideFile);
+    if (session.colorShared != nullptr) CloseHandle(session.colorShared);
+    if (session.outputShared != nullptr) CloseHandle(session.outputShared);
+    if (session.eventHandle != nullptr) CloseHandle(session.eventHandle);
+
+    const bool preloaded = session.preloaded;
+    const ULONGLONG preloadTime = session.preloadTime;
+    const std::filesystem::path runtimeDirectory = session.runtimeDirectory;
+    HMODULE const core = session.core;
+
+    // Release every resource while the NGX-owned D3D12 device is still alive.
+    // Some hooked NGX runtimes invalidate their wrapped device during Shutdown1,
+    // so allowing Session's generated move assignment to release these objects
+    // after shutdown can dereference an invalid COM vtable during ResizeBuffers.
+    session.copyQuery.Reset();
+    session.previewScaler.Reset();
+    session.previewScalerEnumerator.Reset();
+    session.inputScaler.Reset();
+    session.inputScalerEnumerator.Reset();
+    session.videoContext.Reset();
+    session.videoDevice.Reset();
+    session.guidePreview11.Reset();
+    session.output11.Reset();
+    session.color11.Reset();
+    session.context11.Reset();
+
+    session.rtvHeap.Reset();
+    session.motionUpload.Reset();
+    session.depthUpload.Reset();
+    session.zeroMotion.Reset();
+    session.zeroDepth.Reset();
+    session.motion.Reset();
+    session.depth.Reset();
+    session.output.Reset();
+    session.color.Reset();
+    session.fence.Reset();
+    session.list.Reset();
+    session.allocator.Reset();
+    session.queue.Reset();
+
+    // A resize does not end the NGX process lifetime. Keep the initialized
+    // device alive and rebuild only the feature and size-dependent resources.
+    // The patched runtime invalidates its wrapped device during Shutdown1,
+    // which makes a normal COM Release afterwards unsafe.
+    ComPtr<ID3D12Device> device = std::move(session.device);
+    const bool ngxInitialized = session.ngxInitialized;
+
+    session = Session{};
+    session.preloaded = preloaded;
+    session.preloadTime = preloadTime;
+    session.runtimeDirectory = runtimeDirectory;
+    session.core = core;
+    session.device = std::move(device);
+    session.ngxInitialized = ngxInitialized;
+}
+
 std::filesystem::path addon_directory(HMODULE module)
 {
     std::array<wchar_t, 32768> buffer{};
@@ -336,7 +499,7 @@ std::filesystem::path addon_directory(HMODULE module)
     return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
 }
 
-bool load_guide_pack(HMODULE module, uint32_t width, uint32_t height)
+bool load_guide_pack(HMODULE module)
 {
     std::array<wchar_t, 32768> configured{};
     const DWORD configuredLength = GetEnvironmentVariableW(
@@ -373,15 +536,15 @@ bool load_guide_pack(HMODULE module, uint32_t width, uint32_t height)
         session.guideHeader.frameStride * session.guideHeader.frameCount;
     if (std::memcmp(session.guideHeader.magic, "D5GP", 4) != 0 ||
         session.guideHeader.version != 1 ||
-        session.guideHeader.width != width ||
-        session.guideHeader.height != height ||
+        session.guideHeader.width == 0 ||
+        session.guideHeader.height == 0 ||
         session.guideHeader.frameCount == 0 ||
         expectedSize > session.guideSize)
     {
         session.guideState = "guide pack dimensions or format do not match the player";
         return false;
     }
-    session.guideState = "precomputed Depth Anything + DIS optical flow active";
+    session.guideState = "precomputed depth and optical flow stream active";
     const std::string guideMessage = "DLSS 5 Video Renderer loaded " +
         std::to_string(session.guideHeader.frameCount) +
         "-frame precomputed guide stream.";
@@ -550,7 +713,13 @@ bool show_guide_preview(ID3D11Texture2D* backBuffer, int debugView)
     session.context11->UpdateSubresource(
         session.guidePreview11.Get(), 0, nullptr,
         session.guidePreview.data(), session.width * sizeof(uint32_t), 0);
-    session.context11->CopyResource(backBuffer, session.guidePreview11.Get());
+    if (session.width == session.outputWidth &&
+        session.height == session.outputHeight)
+        session.context11->CopyResource(backBuffer, session.guidePreview11.Get());
+    else if (!scale_d3d11_texture(
+            session.guidePreview11.Get(), backBuffer,
+            session.previewScalerEnumerator.Get(), session.previewScaler.Get()))
+        return false;
     return wait_for_d3d11_copy();
 }
 
@@ -608,51 +777,80 @@ bool preload_runtime(HMODULE module)
 bool initialize(
     ID3D11Device* hostDevice,
     HMODULE module,
-    uint32_t width,
-    uint32_t height,
+    uint32_t backBufferWidth,
+    uint32_t backBufferHeight,
     DXGI_FORMAT backBufferFormat)
 {
     session.attempted = true;
-    session.width = width;
-    session.height = height;
-    session.sharedFormat = backBufferFormat;
-    if (!load_guide_pack(module, width, height))
+    if (!load_guide_pack(module))
     {
         log_error("DLSS 5 Video Renderer could not load its guide pack.");
         return false;
     }
-
-    ComPtr<IDXGIDevice> dxgiDevice;
-    ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(hostDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) ||
-        FAILED(dxgiDevice->GetAdapter(&adapter)) ||
-        FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&session.device))))
+    const uint32_t width = session.guideData != nullptr
+        ? session.guideHeader.width : backBufferWidth;
+    const uint32_t height = session.guideData != nullptr
+        ? session.guideHeader.height : backBufferHeight;
+    session.width = width;
+    session.height = height;
+    session.outputWidth = backBufferWidth;
+    session.outputHeight = backBufferHeight;
+    session.sharedFormat = backBufferFormat;
+    if (backBufferWidth < width || backBufferHeight < height)
     {
-        log_error("DLSS 5 Video Renderer could not create its D3D12 device.");
-        return false;
+        session.state = "Window is smaller than the guide resolution (" +
+            std::to_string(width) + "x" + std::to_string(height) +
+            "); showing mpv's native output until the window is enlarged.";
+        reshade::log::message(
+            reshade::log::level::info, session.state.c_str());
+        return true;
+    }
+
+    if (session.device == nullptr)
+    {
+        ComPtr<IDXGIDevice> dxgiDevice;
+        ComPtr<IDXGIAdapter> adapter;
+        if (FAILED(hostDevice->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) ||
+            FAILED(dxgiDevice->GetAdapter(&adapter)) ||
+            FAILED(D3D12CreateDevice(
+                adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                IID_PPV_ARGS(&session.device))))
+        {
+            log_error("DLSS 5 Video Renderer could not create its D3D12 device.");
+            return false;
+        }
     }
 
     const auto init = import<InitExt>(session.core, "NVSDK_NGX_D3D12_Init_Ext");
     const auto allocate = import<AllocateParameters>(session.core, "NVSDK_NGX_D3D12_AllocateParameters");
     session.createFeature = import<CreateFeature>(session.core, "NVSDK_NGX_D3D12_CreateFeature");
     session.evaluateFeature = import<EvaluateFeature>(session.core, "NVSDK_NGX_D3D12_EvaluateFeature");
+    session.releaseFeature = import<ReleaseFeature>(session.core, "NVSDK_NGX_D3D12_ReleaseFeature");
+    session.destroyParameters = import<DestroyParameters>(
+        session.core, "NVSDK_NGX_D3D12_DestroyParameters");
     if (init == nullptr || allocate == nullptr ||
-        session.createFeature == nullptr || session.evaluateFeature == nullptr)
+        session.createFeature == nullptr || session.evaluateFeature == nullptr ||
+        session.releaseFeature == nullptr || session.destroyParameters == nullptr)
     {
         log_error("DLSS 5 Video Renderer is missing required NGX functions.");
         return false;
     }
 
-    bool initialized = false;
-    for (int version = 0x13; version <= 0x16 && !initialized; ++version)
+    if (!session.ngxInitialized)
     {
-        DWORD exception = 0;
-        const NgxResult result = safe_init(
-            init, session.runtimeDirectory.c_str(), session.device.Get(), version, exception);
-        if (exception != 0) break;
-        initialized = result == NgxSuccess;
+        bool initialized = false;
+        for (int version = 0x13; version <= 0x16 && !initialized; ++version)
+        {
+            DWORD exception = 0;
+            const NgxResult result = safe_init(
+                init, session.runtimeDirectory.c_str(), session.device.Get(), version, exception);
+            if (exception != 0) break;
+            initialized = result == NgxSuccess;
+        }
+        session.ngxInitialized = initialized;
     }
-    if (!initialized || allocate(&session.parameters) != NgxSuccess || session.parameters == nullptr)
+    if (!session.ngxInitialized ||
+        allocate(&session.parameters) != NgxSuccess || session.parameters == nullptr)
     {
         log_error("DLSS 5 Video Renderer could not initialize NGX.");
         return false;
@@ -682,6 +880,18 @@ bool initialize(
         log_error("DLSS 5 Video Renderer could not create its D3D11 copy synchronization.");
         return false;
     }
+    if (FAILED(hostDevice->QueryInterface(IID_PPV_ARGS(&session.videoDevice))) ||
+        FAILED(session.context11->QueryInterface(IID_PPV_ARGS(&session.videoContext))) ||
+        !make_video_scaler(
+            backBufferWidth, backBufferHeight, width, height,
+            session.inputScalerEnumerator, session.inputScaler) ||
+        !make_video_scaler(
+            width, height, backBufferWidth, backBufferHeight,
+            session.previewScalerEnumerator, session.previewScaler))
+    {
+        log_error("DLSS 5 Video Renderer could not create its resize processors.");
+        return false;
+    }
 
     D3D12_CLEAR_VALUE depthClear{};
     depthClear.Format = DXGI_FORMAT_R32_FLOAT;
@@ -691,7 +901,7 @@ bool initialize(
             hostDevice, width, height, backBufferFormat, false,
             session.color, session.color11, session.colorShared) ||
         !make_shared_texture(
-            hostDevice, width, height, backBufferFormat, true,
+            hostDevice, backBufferWidth, backBufferHeight, backBufferFormat, true,
             session.output, session.output11, session.outputShared))
     {
         log_error("DLSS 5 Video Renderer could not share mpv frame textures with D3D12.");
@@ -740,6 +950,7 @@ bool initialize(
         previewDesc.Format = backBufferFormat;
         previewDesc.SampleDesc.Count = 1;
         previewDesc.Usage = D3D11_USAGE_DEFAULT;
+        previewDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(hostDevice->CreateTexture2D(
                 &previewDesc, nullptr, &session.guidePreview11)))
         {
@@ -776,8 +987,8 @@ bool initialize(
 
     session.parameters->Set("Width", width);
     session.parameters->Set("Height", height);
-    session.parameters->Set("OutWidth", width);
-    session.parameters->Set("OutHeight", height);
+    session.parameters->Set("OutWidth", backBufferWidth);
+    session.parameters->Set("OutHeight", backBufferHeight);
     session.parameters->Set("PerfQualityValue", 5);
     // SDR input, full-resolution pixel-space motion and inverted relative depth.
     // This mirrors the working game contract without its HDR bit.
@@ -820,7 +1031,10 @@ bool initialize(
     session.parameters->Set("DLSS.Pre.Exposure", 1.0f);
     session.parameters->Set("DLSS.Exposure.Scale", 1.0f);
     session.ready = true;
-    session.state = "NGX transport active with live mpv frames";
+    session.state = "NGX transport active: " +
+        std::to_string(width) + "x" + std::to_string(height) + " -> " +
+        std::to_string(backBufferWidth) + "x" +
+        std::to_string(backBufferHeight);
     reshade::log::message(reshade::log::level::info,
         "DLSS 5 Video Renderer created its persistent NGX transport.");
     return true;
@@ -853,11 +1067,29 @@ bool evaluate_transport(
         log_error("DLSS 5 Video Renderer encountered an unsupported mpv swapchain format.");
         return false;
     }
+    if (session.attempted &&
+        (session.outputWidth != width || session.outputHeight != height ||
+         session.sharedFormat != backBufferDesc.Format))
+    {
+        reset_transport();
+        reshade::log::message(reshade::log::level::info,
+            "DLSS 5 Video Renderer rebuilding after a window resize.");
+    }
     if (!session.attempted && !initialize(
             hostDevice, module, width, height, backBufferDesc.Format)) return false;
-    if (!session.ready || session.width != width || session.height != height ||
+    if (!session.ready || session.outputWidth != width ||
+        session.outputHeight != height ||
         session.sharedFormat != backBufferDesc.Format) return false;
-    session.context11->CopyResource(session.color11.Get(), backBuffer);
+    if (session.width == width && session.height == height)
+        session.context11->CopyResource(session.color11.Get(), backBuffer);
+    else if (!scale_d3d11_texture(
+            backBuffer, session.color11.Get(),
+            session.inputScalerEnumerator.Get(), session.inputScaler.Get()))
+    {
+        log_error("DLSS 5 Video Renderer could not scale mpv's frame for NGX.");
+        session.ready = false;
+        return false;
+    }
     if (!wait_for_d3d11_copy())
     {
         log_error("DLSS 5 Video Renderer timed out copying mpv's frame.");
