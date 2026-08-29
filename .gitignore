@@ -1,0 +1,27 @@
+# Build output
+build/
+out/
+.vs/
+CMakeUserPresets.json
+
+# Runtime logs and captures
+*.log
+captures/
+
+# Proprietary or user-supplied runtime files
+nvngx_*.dll
+sl.*.dll
+*.onnx
+*.engine
+models/
+
+# ReShade runtime state
+ReShade.ini
+ReShadePreset.ini
+reshade-shaders/
+
+# Editors and operating system
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
