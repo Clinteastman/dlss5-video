@@ -1,20 +1,29 @@
 # DLSS 5 Video Lab
 
+> [!IMPORTANT]
+> **This project is retired and no longer under active development.**
+>
+> Please use or contribute to
+> [JessicaNataliaMods/dlss-5-video-player](https://gitlab.com/JessicaNataliaMods/dlss-5-video-player)
+> instead. It provides a purpose-built D3D12 video player with tighter control
+> over frame timing, temporal guides, DLSS evaluation, and presentation. This
+> repository remains available as an archive of our mpv integration and guide
+> generation experiments.
+
 > [!WARNING]
-> **Experimental software — under active development.** This is a working
-> research prototype, not a finished video player or production-ready filter.
-> It requires local setup and user-supplied third-party components; output
-> quality varies, some setting combinations may stall, and interfaces may
-> change without notice.
+> **Historical experimental software.** This is a research prototype, not a
+> finished video player or production-ready filter. It requires local setup and
+> user-supplied third-party components; output quality varies and some setting
+> combinations may stall.
 
 An experimental Windows project for applying NVIDIA video enhancement and
 DLSS Neural Rendering to ordinary video, with visible controls and useful
 diagnostics.
 
-The project is starting as an integration lab, not a new media player. Existing
+The project began as an integration lab, not a new media player. Existing
 open-source software already handles playback, decoding, NVIDIA RTX Video Super
-Resolution (VSR), and parts of the NGX bridge. This repository will concentrate
-on the missing pipeline:
+Resolution (VSR), and parts of the NGX bridge. This repository concentrated on
+the missing pipeline:
 
 ```text
 video frame -> depth estimate + optical flow -> DLSS Neural Rendering -> display
@@ -229,5 +238,5 @@ Optical Flow temporal-hint approach, with selectable quarter, half, and full
 resolutions and Fast, Balanced, and Quality modes. The largest remaining
 differences are temporally stable video depth, colour/exposure handling,
 guide-to-video latency when inference exceeds one presentation interval, and
-source material. The next milestone is GPU-shared frame transport and
+source material. The planned next milestone was GPU-shared frame transport and
 delayed-frame alignment, followed by controlled colour-contract testing.
