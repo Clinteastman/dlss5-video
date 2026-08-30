@@ -1,5 +1,12 @@
 # DLSS 5 Video Lab
 
+> [!WARNING]
+> **Experimental software — under active development.** This is a working
+> research prototype, not a finished video player or production-ready filter.
+> It requires local setup and user-supplied third-party components; output
+> quality varies, some setting combinations may stall, and interfaces may
+> change without notice.
+
 An experimental Windows project for applying NVIDIA video enhancement and
 DLSS Neural Rendering to ordinary video, with visible controls and useful
 diagnostics.
@@ -13,13 +20,17 @@ on the missing pipeline:
 video frame -> depth estimate + optical flow -> DLSS Neural Rendering -> display
 ```
 
-## Planned milestones
+## Development checkpoints
 
-1. Establish an mpv playback baseline with NVIDIA VSR and an A/B toggle.
-2. Capture the displayed D3D11 video frame without modifying protected content.
-3. Adapt the existing D3D11-to-D3D12 NGX bridge to make a controlled DLSS call.
-4. Supply estimated depth and optical flow.
-5. Add a small overlay for style, strength, diagnostics, and bypass comparison.
+- [x] Establish an mpv playback baseline with NVIDIA VSR and an A/B toggle.
+- [x] Capture the displayed D3D11 video frame without modifying protected
+  content.
+- [x] Adapt the D3D11-to-D3D12 NGX bridge for a controlled DLSS call.
+- [x] Supply real-time estimated depth and NVIDIA Optical Flow.
+- [x] Add a ReShade overlay for quality controls, diagnostics, guide views, and
+  bypass comparison.
+- [ ] Improve temporal guide alignment, colour handling, stability, and
+  performance until moving output approaches the frozen-frame quality.
 
 ## Existing work we intend to reuse
 
@@ -197,13 +208,15 @@ decoded frames, offline clips, and live mpv frames have been processed by hidden
 NGX feature 18 and read back successfully on an RTX 4090 with a user-supplied
 patched 310.8.0 runtime. The live path keeps one D3D12 device and NGX feature
 active, synchronises its D3D11/D3D12 copies, and continuously evaluates at the
-source frame rate. A shared-memory companion now calculates depth and NVIDIA
-Optical Flow from the frames being presented, so arbitrary local files and
-YouTube videos no longer depend on a precomputed guide pack. On the RTX 4090
-test machine, the default 392x392 depth inference normally completes in about
-31-40 ms while mpv continues presenting. Resizing above the guide resolution
-rebuilds the NGX feature with separate input and output sizes, so NGX generates
-the larger image instead of the player stretching a native-size result.
+source frame rate while guide generation runs asynchronously. A shared-memory
+companion calculates depth and NVIDIA Optical Flow from the frames being
+presented, so arbitrary local files and YouTube videos no longer depend on a
+precomputed guide pack. On the RTX 4090 test machine, the current high-quality
+default of 518x518 depth and full 1280x720 Fast optical flow usually takes about
+60-75 ms per new guide, with occasional larger spikes, while mpv keeps
+presenting. Resizing above the guide resolution rebuilds the NGX feature with
+separate input and output sizes, so NGX generates the larger image instead of
+the player stretching a native-size result.
 
 This is still an experimental checkpoint, not a finished video filter. The
 current output can show grey or shadowed faces and an under-converged, textured
@@ -212,8 +225,9 @@ large repeated-warp instability, but the remaining quality does not yet match
 the reference OBS prototype. The same user-supplied runtime gives clean results
 in games on the test machine, which points to our guide and colour inputs rather
 than the runtime itself. The guide path now matches the reference's NVIDIA
-Optical Flow fast/half-resolution/temporal-hint configuration. The largest
-remaining differences are temporally stable video depth, colour/exposure
-handling, guide-to-video latency when inference exceeds one presentation
-interval, and source material. The next milestone is GPU-shared frame transport
-and delayed-frame alignment, followed by controlled colour-contract testing.
+Optical Flow temporal-hint approach, with selectable quarter, half, and full
+resolutions and Fast, Balanced, and Quality modes. The largest remaining
+differences are temporally stable video depth, colour/exposure handling,
+guide-to-video latency when inference exceeds one presentation interval, and
+source material. The next milestone is GPU-shared frame transport and
+delayed-frame alignment, followed by controlled colour-contract testing.
